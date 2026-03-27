@@ -27,6 +27,9 @@ CEXE_sources += EB.cpp
 CEXE_sources += Geometry.cpp
 CEXE_sources += InitEB.cpp
 CEXE_sources += RotSource.cpp
+CEXE_sources += ODTLES/ODTManager.cpp
+CEXE_sources += ODTLES/ODTParams.cpp
+CEXE_sources += ODTLES/ODTLineState.cpp
 
 #C++ headers
 CEXE_headers += PeleC.H
@@ -53,6 +56,9 @@ CEXE_headers += EBStencilTypes.H
 CEXE_headers += EB.H
 CEXE_headers += Geometry.H
 CEXE_headers += SparseData.H
+CEXE_headers += ODTLES/ODTManager.H
+CEXE_headers += ODTLES/ODTParams.H
+CEXE_headers += ODTLES/ODTLineState.H
 
 ifeq ($(USE_PARTICLES), TRUE)
   CEXE_sources += Particle.cpp
