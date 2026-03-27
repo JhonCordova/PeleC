@@ -114,20 +114,24 @@ PeleC::getLESTerm(
 
   switch (les_model) {
 
-  case 0:
+  case PeleC::LESModelSmagorinsky:
     getSmagorinskyLESTerm(time, dt, LESTerm, reflux_factor);
     break;
 
-  case 1:
+  case PeleC::LESModelDynamicSmagorinsky:
     getDynamicSmagorinskyLESTerm(time, dt, LESTerm, reflux_factor);
     break;
 
-  case 2:
+  case PeleC::LESModelWALE:
     getWALELESTerm(time, dt, LESTerm, reflux_factor);
     break;
 
-  case 3:
+  case PeleC::LESModelVreman:
     getVremanLESTerm(time, dt, LESTerm, reflux_factor);
+    break;
+
+  case PeleC::LESModelODT:
+    getODTLESTerm(time, dt, LESTerm, reflux_factor);
     break;
 
   default:
@@ -148,6 +152,18 @@ PeleC::getLESTerm(
     amrex::MultiFab::Copy(
       LESTerm, filtered_les_source, 0, 0, NVAR, filtered_les_source.nGrow());
   }
+}
+
+void
+PeleC::getODTLESTerm(
+  amrex::Real time,
+  amrex::Real dt,
+  amrex::MultiFab& LESTerm,
+  amrex::Real reflux_factor)
+{
+  amrex::ignore_unused(time, dt, reflux_factor);
+  // Placeholder for embedded ODT SGS coupling: zero contribution in T1.
+  LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());
 }
 
 void

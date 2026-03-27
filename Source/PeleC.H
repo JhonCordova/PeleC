@@ -423,6 +423,12 @@ public:
     amrex::MultiFab& LESTerm,
     amrex::Real flux_factor);
 
+  void getODTLESTerm(
+    amrex::Real time,
+    amrex::Real dt,
+    amrex::MultiFab& LESTerm,
+    amrex::Real flux_factor);
+
   void construct_old_les_source(
     amrex::Real time, amrex::Real dt, int sub_iteration, int sub_ncycle);
 
@@ -774,6 +780,14 @@ protected:
   static amrex::Real getCPUTime();
 
   static bool do_diffuse;
+
+  enum LESModelID : int {
+    LESModelSmagorinsky = 0,
+    LESModelDynamicSmagorinsky = 1,
+    LESModelWALE = 2,
+    LESModelVreman = 3,
+    LESModelODT = 4
+  };
 
   static int les_model;
   static int les_filter_type;

@@ -1836,7 +1836,7 @@ PeleC::derive(const std::string& name, amrex::Real time, int ngrow)
       amrex::MultiFab::Copy(*derive_dat, LES_Coeffs, comp_Cs2, 0, 1, ngrow);
     } else if (name == "C_I") {
       amrex::MultiFab::Copy(*derive_dat, LES_Coeffs, comp_CI, 0, 1, ngrow);
-    } else if ((les_model != 1) && (name == "Pr_T")) {
+    } else if ((les_model != LESModelDynamicSmagorinsky) && (name == "Pr_T")) {
       amrex::MultiFab::Copy(*derive_dat, LES_Coeffs, comp_PrT, 0, 1, ngrow);
     } else { // Pr_T, les_model==1
       amrex::MultiFab::Copy(
@@ -1923,15 +1923,15 @@ PeleC::init_les()
   // Fill with default coefficient values
   LES_Coeffs.define(grids, dmap, nCompC, 1, amrex::MFInfo(), Factory());
   LES_Coeffs.setVal(0.0);
-  if (les_model == 2) {
+  if (les_model == LESModelWALE) {
     LES_Coeffs.setVal(Cw * Cw, comp_Cs2, 1, LES_Coeffs.nGrow());
-  } else if (les_model == 3) {
+  } else if (les_model == LESModelVreman) {
     LES_Coeffs.setVal(2.5 * Cs * Cs, comp_Cs2, 1, LES_Coeffs.nGrow());
   } else {
     LES_Coeffs.setVal(Cs * Cs, comp_Cs2, 1, LES_Coeffs.nGrow());
   }
   LES_Coeffs.setVal(CI, comp_CI, 1, LES_Coeffs.nGrow());
-  if (les_model == 1) {
+  if (les_model == LESModelDynamicSmagorinsky) {
     LES_Coeffs.setVal(Cs * Cs * PrT, comp_Cs2ovPrT, 1, LES_Coeffs.nGrow());
   } else {
     LES_Coeffs.setVal(PrT, comp_PrT, 1, LES_Coeffs.nGrow());
