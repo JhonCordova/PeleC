@@ -33,6 +33,7 @@ CEXE_sources += RotSource.cpp
 CEXE_sources += ODTManager.cpp
 CEXE_sources += ODTParams.cpp
 CEXE_sources += ODTLineState.cpp
+CEXE_sources += ODTLineGeometry.cpp
 
 #C++ headers
 CEXE_headers += PeleC.H
@@ -62,6 +63,7 @@ CEXE_headers += SparseData.H
 CEXE_headers += ODTManager.H
 CEXE_headers += ODTParams.H
 CEXE_headers += ODTLineState.H
+CEXE_headers += ODTLineGeometry.H
 
 ifeq ($(USE_PARTICLES), TRUE)
   CEXE_sources += Particle.cpp

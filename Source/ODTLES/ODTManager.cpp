@@ -26,15 +26,60 @@ ODTManager::initializeLevel(
 void
 ODTManager::clear()
 {
+  m_line_geometries.clear();
   m_line_states.clear();
   m_initialized = false;
   m_level = -1;
 }
 
-ODTLineState&
-ODTManager::getOrCreateLineState(const amrex::IntVect& owner_cell, int dir)
+ODTLineGeometry&
+ODTManager::getOrCreateLineGeometry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom)
 {
-  const LineKey key{owner_cell, dir};
+  const LineKey key{level, owner_cell, dir};
+  auto it = m_line_geometries.find(key);
+  if (it == m_line_geometries.end()) {
+    it =
+      m_line_geometries.emplace(key, ODTLineGeometry(geom, level, owner_cell, dir))
+        .first;
+  } else {
+    it->second.define(geom, level, owner_cell, dir);
+  }
+  return it->second;
+}
+
+ODTLineGeometry*
+ODTManager::findLineGeometry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir)
+{
+  const LineKey key{level, owner_cell, dir};
+  const auto it = m_line_geometries.find(key);
+  return (it == m_line_geometries.end()) ? nullptr : &it->second;
+}
+
+const ODTLineGeometry*
+ODTManager::findLineGeometry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir) const
+{
+  const LineKey key{level, owner_cell, dir};
+  const auto it = m_line_geometries.find(key);
+  return (it == m_line_geometries.end()) ? nullptr : &it->second;
+}
+
+ODTLineState&
+ODTManager::getOrCreateLineState(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir)
+{
+  const LineKey key{level, owner_cell, dir};
   auto it_inserted_pair =
     m_line_states.emplace(key, ODTLineState(owner_cell, dir));
   auto it = it_inserted_pair.first;
@@ -46,17 +91,23 @@ ODTManager::getOrCreateLineState(const amrex::IntVect& owner_cell, int dir)
 }
 
 ODTLineState*
-ODTManager::findLineState(const amrex::IntVect& owner_cell, int dir)
+ODTManager::findLineState(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir)
 {
-  const LineKey key{owner_cell, dir};
+  const LineKey key{level, owner_cell, dir};
   const auto it = m_line_states.find(key);
   return (it == m_line_states.end()) ? nullptr : &it->second;
 }
 
 const ODTLineState*
-ODTManager::findLineState(const amrex::IntVect& owner_cell, int dir) const
+ODTManager::findLineState(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir) const
 {
-  const LineKey key{owner_cell, dir};
+  const LineKey key{level, owner_cell, dir};
   const auto it = m_line_states.find(key);
   return (it == m_line_states.end()) ? nullptr : &it->second;
 }
@@ -64,6 +115,9 @@ ODTManager::findLineState(const amrex::IntVect& owner_cell, int dir) const
 bool
 ODTManager::LineKey::operator<(const LineKey& other) const noexcept
 {
+  if (level != other.level) {
+    return level < other.level;
+  }
   if (owner_cell[0] != other.owner_cell[0]) {
     return owner_cell[0] < other.owner_cell[0];
   }
