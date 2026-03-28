@@ -162,7 +162,8 @@ PeleC::getODTLESTerm(
   amrex::Real reflux_factor)
 {
   amrex::ignore_unused(time, dt, reflux_factor);
-  // Placeholder for embedded ODT SGS coupling: zero contribution in T1.
+  // ODTLES hook remains infrastructure-only at current stage (post-T3):
+  // return zero SGS contribution until reconciliation/stepping/extraction land.
   LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());
 }
 

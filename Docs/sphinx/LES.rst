@@ -16,13 +16,13 @@ Models for large eddy simulations
 .. warning:: The LES source terms do not currently support EB cut cells.
 
 
-PeleC currently supports two LES models, the constant and dynamic
-Smagorinsky models. An extensive discussion of the compressible
-version of these models can be found in Martín, M. Pino, U. Piomelli,
-and G. V. Candler. "Subgrid-Scale Models for Compressible Large-Eddy
-Simulations." Theoretical and Computational Fluid Dynamics 13, no. 5
-(2000): 361–76. The constant Smagorinsky model was verified using the
-method of manufactured solutions.
+PeleC currently supports the constant and dynamic Smagorinsky models,
+as well as WALE and Vreman closures. An extensive discussion of the
+compressible Smagorinsky models can be found in Martín, M. Pino,
+U. Piomelli, and G. V. Candler. "Subgrid-Scale Models for
+Compressible Large-Eddy Simulations." Theoretical and Computational
+Fluid Dynamics 13, no. 5 (2000): 361–76. The constant Smagorinsky
+model was verified using the method of manufactured solutions.
 
 
 Using
@@ -37,6 +37,13 @@ constant Smagorinsky. The user can pick the LES model by setting
 * ``les_model = 1``: dynamic Smagorinsky model
 * ``les_model = 2``: WALE model
 * ``les_model = 3``: Vreman model
+* ``les_model = 4``: ODTLES embedded-SGS path (current infrastructure placeholder)
+
+.. note::
+   ``pelec.les_model = 4`` currently routes through the ODTLES hook but
+   returns zero SGS contribution. It is infrastructure-only at this stage
+   (identity/geometry/state/manager scaffolding) and is not yet a physically
+   active SGS model.
 
 For the constant Smagorinsky model, the user may define the model
 coefficients: ``pelec.Cs``, ``pelec.CI``, and ``pelec.PrT``. These
