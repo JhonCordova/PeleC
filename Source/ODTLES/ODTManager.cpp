@@ -10,6 +10,63 @@ namespace pelec::odtles
 
 ODTManager::ODTManager(const ODTParams& params) : m_params(params) {}
 
+int
+ODTManager::SupportData::count(SupportProvenance p) const noexcept
+{
+  int n = 0;
+  for (const auto& s : ordered_samples) {
+    if (s.provenance == p) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+bool
+ODTManager::SupportData::allSameLevelAccepted() const noexcept
+{
+  for (const auto& s : ordered_samples) {
+    if (
+      s.provenance != SupportProvenance::SameLevelValidCell &&
+      s.provenance != SupportProvenance::SameLevelFilledGhost) {
+      return false;
+    }
+    if (!s.has_value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<ODTManager::ConservativeCell>
+ODTManager::SupportData::conservativeAveragesOrdered() const
+{
+  std::vector<ConservativeCell> vals;
+  vals.reserve(ordered_samples.size());
+  for (const auto& s : ordered_samples) {
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      s.has_value,
+      "SupportData cannot provide conservative averages for missing values");
+    vals.push_back(s.value);
+  }
+  return vals;
+}
+
+ODTManager::ConservativeCell
+ODTManager::SupportData::ownerAverage(const ODTLineGeometry& geom) const
+{
+  const int owner = geom.ownerLocalOrdinal();
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    owner >= 0, "SupportData owner ordinal is invalid");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    owner < static_cast<int>(ordered_samples.size()),
+    "SupportData owner ordinal out of range");
+  const auto& s = ordered_samples[static_cast<std::size_t>(owner)];
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    s.has_value, "SupportData owner sample has no value");
+  return s.value;
+}
+
 void
 ODTManager::setParams(const ODTParams& params)
 {
@@ -141,6 +198,130 @@ ODTManager::getOrCreateLineState(
   return getOrCreateLineEntry(level, owner_cell, dir, geom).state;
 }
 
+bool
+ODTManager::findCellAverageInMF(
+  const amrex::IntVect& iv,
+  const amrex::MultiFab& state,
+  bool use_validbox_only,
+  ConservativeCell& out_cell)
+{
+  for (amrex::MFIter mfi(state, false); mfi.isValid(); ++mfi) {
+    const amrex::Box bx = use_validbox_only ? mfi.validbox() : mfi.fabbox();
+    if (!bx.contains(iv)) {
+      continue;
+    }
+
+    const auto arr = state.const_array(mfi);
+    out_cell.rho = arr(iv, URHO);
+    out_cell.rhou = arr(iv, UMX);
+    out_cell.rhov = arr(iv, UMY);
+    out_cell.rhow = arr(iv, UMZ);
+    out_cell.rhoE = arr(iv, UEDEN);
+    return true;
+  }
+  return false;
+}
+
+ODTManager::SupportData
+ODTManager::collectSupportData(
+  const ODTLineGeometry& line_geom,
+  const amrex::Geometry& geom,
+  const amrex::MultiFab& state_valid,
+  const amrex::MultiFab& state_same_level,
+  const amrex::MultiFab& state_host_filled) const
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    line_geom.isDefined(), "ODTManager support collection requires geometry");
+
+  SupportData data;
+  const auto& support = line_geom.supportCells();
+  data.ordered_samples.reserve(support.size());
+  const amrex::IntVect owner = line_geom.ownerCell();
+  const int dir = line_geom.dir();
+
+  for (int i = 0; i < static_cast<int>(support.size()); ++i) {
+    const auto& seg = support[static_cast<std::size_t>(i)];
+    SupportSample sample;
+    sample.support_ordinal = i;
+    sample.iv = owner;
+    sample.iv[dir] = seg.host_cell_index;
+
+    ConservativeCell c{};
+    if (!geom.Domain().contains(sample.iv)) {
+      sample.provenance = SupportProvenance::PhysicalBoundaryGhost;
+      sample.has_value = false;
+    } else if (findCellAverageInMF(sample.iv, state_valid, true, c)) {
+      sample.provenance = SupportProvenance::SameLevelValidCell;
+      sample.value = c;
+      sample.has_value = true;
+    } else if (findCellAverageInMF(sample.iv, state_same_level, false, c)) {
+      sample.provenance = SupportProvenance::SameLevelFilledGhost;
+      sample.value = c;
+      sample.has_value = true;
+    } else if (findCellAverageInMF(sample.iv, state_host_filled, false, c)) {
+      sample.provenance = SupportProvenance::AMRCoarseFineFilled;
+      sample.value = c;
+      sample.has_value = true;
+    } else {
+      sample.provenance = SupportProvenance::InvalidUnsupported;
+      sample.has_value = false;
+    }
+
+    data.ordered_samples.push_back(sample);
+  }
+
+  return data;
+}
+
+ODTLineState&
+ODTManager::initializeLineStateFromSupportData(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  const SupportData& support_data)
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    support_data.allSameLevelAccepted(),
+    "ODTManager initialize requires same-level accepted support provenance");
+  const auto local_support_cell_averages =
+    support_data.conservativeAveragesOrdered();
+  return initializeLineStateFromLESSupportAverages(
+    level, owner_cell, dir, geom, local_support_cell_averages);
+}
+
+ODTLineState&
+ODTManager::reconcileLineStateFromSupportData(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  const SupportData& support_data)
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    support_data.allSameLevelAccepted(),
+    "ODTManager reconcile requires same-level accepted support provenance");
+
+  assertLevelScope(level);
+  auto* entry = findLineEntry(level, owner_cell, dir);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    entry != nullptr,
+    "ODTManager reconcile requires an existing persistent line entry");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    entry->state.initialized() && entry->state.valid(),
+    "ODTManager reconcile requires an existing valid line state");
+  AMREX_ALWAYS_ASSERT(entry->geometry.isDefined());
+  AMREX_ALWAYS_ASSERT(entry->geometry.level() == level);
+  AMREX_ALWAYS_ASSERT(entry->geometry.ownerCell() == owner_cell);
+  AMREX_ALWAYS_ASSERT(entry->geometry.dir() == dir);
+
+  const auto owner_avg = support_data.ownerAverage(entry->geometry);
+  ODTReconcile::reconcileExistingLineStateToOwnerAverage(
+    entry->geometry, owner_avg, entry->state);
+  amrex::ignore_unused(geom);
+  return entry->state;
+}
+
 ODTLineState&
 ODTManager::initializeLineStateFromLESState(
   int level,
@@ -151,7 +332,7 @@ ODTManager::initializeLineStateFromLESState(
 {
   auto& entry = getOrCreateLineEntry(level, owner_cell, dir, geom);
   const auto local_support_cell_averages =
-    assembleLocalSupportCellAverages(entry.geometry, state);
+    assembleLocalSupportCellAverages(entry.geometry, geom, state);
   return initializeLineStateFromLESSupportAverages(
     level, owner_cell, dir, geom, local_support_cell_averages);
 }
@@ -176,9 +357,8 @@ ODTManager::reconcileLineStateToLESState(
   AMREX_ALWAYS_ASSERT(entry->geometry.level() == level);
   AMREX_ALWAYS_ASSERT(entry->geometry.ownerCell() == owner_cell);
   AMREX_ALWAYS_ASSERT(entry->geometry.dir() == dir);
-  amrex::ignore_unused(geom);
 
-  const auto owner_avg = getConservativeCellAverageAt(owner_cell, state);
+  const auto owner_avg = getConservativeCellAverageAt(owner_cell, geom, state);
   ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     entry->geometry, owner_avg, entry->state);
   return entry->state;
@@ -187,6 +367,7 @@ ODTManager::reconcileLineStateToLESState(
 std::vector<ODTLineState::ConservativeCell>
 ODTManager::assembleLocalSupportCellAverages(
   const ODTLineGeometry& line_geom,
+  const amrex::Geometry& geom,
   const amrex::MultiFab& state) const
 {
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -204,7 +385,7 @@ ODTManager::assembleLocalSupportCellAverages(
     amrex::IntVect iv = owner;
     iv[dir] = seg.host_cell_index;
     local_support_cell_averages[static_cast<std::size_t>(i)] =
-      getConservativeCellAverageAt(iv, state);
+      getConservativeCellAverageAt(iv, geom, state);
   }
 
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -218,30 +399,21 @@ ODTManager::assembleLocalSupportCellAverages(
 ODTLineState::ConservativeCell
 ODTManager::getConservativeCellAverageAt(
   const amrex::IntVect& iv,
+  const amrex::Geometry& geom,
   const amrex::MultiFab& state) const
 {
-  ODTLineState::ConservativeCell c{};
-  bool found = false;
-  for (amrex::MFIter mfi(state, false); mfi.isValid(); ++mfi) {
-    const amrex::Box vbx = mfi.validbox();
-    if (!vbx.contains(iv)) {
-      continue;
-    }
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    geom.Domain().contains(iv),
+    "ODTManager support-cell collection requires physical LES support indices "
+    "inside the level domain");
 
-    const auto arr = state.const_array(mfi);
-    c.rho = arr(iv, URHO);
-    c.rhou = arr(iv, UMX);
-    c.rhov = arr(iv, UMY);
-    c.rhow = arr(iv, UMZ);
-    c.rhoE = arr(iv, UEDEN);
-    found = true;
-    break;
-  }
+  ODTLineState::ConservativeCell c{};
+  const bool found = findCellAverageInMF(iv, state, false, c);
 
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
     found,
-    "ODTManager requires valid LES cell ownership (ghost values are not "
-    "accepted as physical means)");
+    "ODTManager could not locate support cell in same-level host state; "
+    "AMR/coarse-fine support provenance is not accepted in this phase");
   return c;
 }
 

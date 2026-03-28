@@ -161,9 +161,106 @@ PeleC::getODTLESTerm(
   amrex::MultiFab& LESTerm,
   amrex::Real reflux_factor)
 {
-  amrex::ignore_unused(time, dt, reflux_factor);
-  // ODTLES hook remains infrastructure-only at current stage (post-T3):
-  // return zero SGS contribution until reconciliation/stepping/extraction land.
+  amrex::ignore_unused(dt, reflux_factor);
+
+  // ODT runtime hookup (T4): host-side LES->ODT preparation only.
+  // This updates persistent local line state via first-time init/reconcile
+  // and keeps SGS return neutral until ODT stepping/extraction are added.
+  odt_manager.initializeLevel(level, grids, dmap);
+
+  constexpr int support_ng =
+    (pelec::odtles::ODTLineGeometry::MVPNumSupportCells - 1) / 2;
+
+  // T4 provenance policy:
+  // 1) Build valid level state at requested time.
+  // 2) Build same-level ghost extension via FillBoundary only.
+  // This allows same-level inter-rank/periodic support collection while
+  // explicitly avoiding AMR coarse-fine ghost provenance for support means.
+  amrex::MultiFab state_valid(grids, dmap, NVAR, 0, amrex::MFInfo(), Factory());
+  FillPatch(*this, state_valid, 0, time, State_Type, 0, NVAR);
+
+  amrex::MultiFab state_same_level(
+    grids, dmap, NVAR, support_ng, amrex::MFInfo(), Factory());
+  amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
+  state_same_level.FillBoundary(geom.periodicity());
+
+  // Only for provenance surfacing: this contains host-filled ghosts that may
+  // include AMR/coarse-fine fill mechanisms. It is not the support source used
+  // by the T4 math path unless policy later accepts that provenance.
+  amrex::MultiFab state_host_filled(
+    grids, dmap, NVAR, support_ng, amrex::MFInfo(), Factory());
+  FillPatch(*this, state_host_filled, support_ng, time, State_Type, 0, NVAR);
+
+  long rejected_boundary_entries = 0;
+  long rejected_amr_entries = 0;
+  long rejected_invalid_entries = 0;
+  long rejected_mixed_entries = 0;
+
+  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
+    const amrex::Box& vbx = mfi.validbox();
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv))
+    {
+      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+        pelec::odtles::ODTLineGeometry line_geom(geom, level, iv, dir);
+        const auto support_data = odt_manager.collectSupportData(
+          line_geom, geom, state_valid, state_same_level, state_host_filled);
+
+        const int n_boundary = support_data.count(
+          pelec::odtles::ODTManager::SupportProvenance::PhysicalBoundaryGhost);
+        const int n_amr = support_data.count(
+          pelec::odtles::ODTManager::SupportProvenance::AMRCoarseFineFilled);
+        const int n_invalid = support_data.count(
+          pelec::odtles::ODTManager::SupportProvenance::InvalidUnsupported);
+        const int n_reject_types =
+          (n_boundary > 0 ? 1 : 0) + (n_amr > 0 ? 1 : 0) + (n_invalid > 0 ? 1 : 0);
+
+        // Explicit T4 runtime provenance policy:
+        // allow: SameLevelValidCell, SameLevelFilledGhost
+        // reject: PhysicalBoundaryGhost, AMRCoarseFineFilled, InvalidUnsupported
+        if (n_reject_types > 1) {
+          ++rejected_mixed_entries;
+          continue;
+        }
+        if (n_boundary > 0) {
+          ++rejected_boundary_entries;
+          continue;
+        }
+        if (n_amr > 0) {
+          ++rejected_amr_entries;
+          continue;
+        }
+        if (n_invalid > 0) {
+          ++rejected_invalid_entries;
+          continue;
+        }
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          support_data.allSameLevelAccepted(),
+          "ODTLES support provenance policy mismatch in runtime hook");
+
+        auto* entry = odt_manager.findLineEntry(level, iv, dir);
+        if (entry != nullptr && entry->state.valid()) {
+          odt_manager.reconcileLineStateFromSupportData(
+            level, iv, dir, geom, support_data);
+        } else {
+          odt_manager.initializeLineStateFromSupportData(
+            level, iv, dir, geom, support_data);
+        }
+      }
+    }
+  }
+
+  const long rejected_total = rejected_boundary_entries + rejected_amr_entries +
+                              rejected_invalid_entries + rejected_mixed_entries;
+  if (verbose != 0 && rejected_total > 0) {
+    amrex::Print()
+      << "ODTLES: rejected " << rejected_total
+      << " owner-direction entries by explicit T4 support-provenance policy. "
+      << "[boundary_ghost=" << rejected_boundary_entries
+      << ", amr_coarse_fine=" << rejected_amr_entries
+      << ", invalid=" << rejected_invalid_entries
+      << ", mixed=" << rejected_mixed_entries << "]" << std::endl;
+  }
+
   LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());
 }
 

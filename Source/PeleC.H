@@ -25,6 +25,7 @@
 #include "SparseData.H"
 #include "EBStencilTypes.H"
 #include "DiagBase.H"
+#include "ODTManager.H"
 
 enum StateType { State_Type = 0, Reactions_Type, Work_Estimate_Type };
 
@@ -798,6 +799,7 @@ protected:
   static int les_test_filter_fgr;
   amrex::MultiFab LES_Coeffs;
   amrex::MultiFab filtered_les_source;
+  pelec::odtles::ODTManager odt_manager;
 
 #ifdef PELE_USE_MASA
   static bool mms_initialized;

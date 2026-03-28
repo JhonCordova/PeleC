@@ -21,10 +21,40 @@ namespace pelec::odtles
 class ODTManager
 {
 public:
+  using ConservativeCell = ODTLineState::ConservativeCell;
+
   struct LineEntry
   {
     ODTLineGeometry geometry;
     ODTLineState state;
+  };
+
+  enum class SupportProvenance : int
+  {
+    SameLevelValidCell = 0,
+    SameLevelFilledGhost = 1,
+    PhysicalBoundaryGhost = 2,
+    AMRCoarseFineFilled = 3,
+    InvalidUnsupported = 4
+  };
+
+  struct SupportSample
+  {
+    int support_ordinal = -1;
+    amrex::IntVect iv{AMREX_D_DECL(0, 0, 0)};
+    SupportProvenance provenance = SupportProvenance::InvalidUnsupported;
+    ConservativeCell value{};
+    bool has_value = false;
+  };
+
+  struct SupportData
+  {
+    std::vector<SupportSample> ordered_samples;
+
+    int count(SupportProvenance p) const noexcept;
+    bool allSameLevelAccepted() const noexcept;
+    std::vector<ConservativeCell> conservativeAveragesOrdered() const;
+    ConservativeCell ownerAverage(const ODTLineGeometry& geom) const;
   };
 
   ODTManager() = default;
@@ -78,9 +108,27 @@ public:
     const amrex::IntVect& owner_cell,
     int dir,
     const amrex::Geometry& geom);
-  // Host-side input-contract path: assemble local support-cell conservative
-  // means directly from valid LES cells in state and initialize first-time
-  // line state.
+  SupportData collectSupportData(
+    const ODTLineGeometry& line_geom,
+    const amrex::Geometry& geom,
+    const amrex::MultiFab& state_valid,
+    const amrex::MultiFab& state_same_level,
+    const amrex::MultiFab& state_host_filled) const;
+  ODTLineState& initializeLineStateFromSupportData(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom,
+    const SupportData& support_data);
+  ODTLineState& reconcileLineStateFromSupportData(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom,
+    const SupportData& support_data);
+  // Host-side input-contract path: `state` must carry same-level LES valid
+  // cells plus same-level ghost copies (for inter-rank/periodic coverage),
+  // not AMR coarse-fine ghost surrogates for support means.
   ODTLineState& initializeLineStateFromLESState(
     int level,
     const amrex::IntVect& owner_cell,
@@ -115,11 +163,18 @@ private:
   };
 
   void assertLevelScope(int level) const;
+  static bool findCellAverageInMF(
+    const amrex::IntVect& iv,
+    const amrex::MultiFab& state,
+    bool use_validbox_only,
+    ConservativeCell& out_cell);
   std::vector<ODTLineState::ConservativeCell> assembleLocalSupportCellAverages(
     const ODTLineGeometry& line_geom,
+    const amrex::Geometry& geom,
     const amrex::MultiFab& state) const;
   ODTLineState::ConservativeCell getConservativeCellAverageAt(
     const amrex::IntVect& iv,
+    const amrex::Geometry& geom,
     const amrex::MultiFab& state) const;
   ODTLineState& initializeLineStateFromLESSupportAverages(
     int level,
