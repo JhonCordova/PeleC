@@ -105,6 +105,32 @@ componentArrayFromCell(const ODTLineState::ConservativeCell& c)
   return {c.rho, c.rhou, c.rhov, c.rhow, c.rhoE};
 }
 
+amrex::Real
+specificInternalEnergy(const std::array<amrex::Real, 5>& q)
+{
+  const amrex::Real rho = q[0];
+  if (rho <= 0.0) {
+    return -1.0;
+  }
+  const amrex::Real inv_rho = 1.0 / rho;
+  const amrex::Real kinetic =
+    0.5 * inv_rho * (q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  const amrex::Real rhoe = q[4] - kinetic;
+  return rhoe * inv_rho;
+}
+
+bool
+isAdmissible(
+  const std::array<amrex::Real, 5>& q,
+  const ODTReconcile::ReconcileControls& ctrl)
+{
+  if (q[0] <= ctrl.rho_floor) {
+    return false;
+  }
+  const amrex::Real eint = specificInternalEnergy(q);
+  return eint > ctrl.e_floor;
+}
+
 } // namespace
 
 void
@@ -277,6 +303,23 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
   const ConservativeCell& owner_cell_average,
   ODTLineState& line_state)
 {
+  reconcileExistingLineStateToOwnerAverage(
+    geom, owner_cell_average, line_state, defaultReconcileControls());
+}
+
+ODTReconcile::ReconcileControls
+ODTReconcile::defaultReconcileControls()
+{
+  return ReconcileControls{};
+}
+
+void
+ODTReconcile::reconcileExistingLineStateToOwnerAverage(
+  const ODTLineGeometry& geom,
+  const ConservativeCell& owner_cell_average,
+  ODTLineState& line_state,
+  const ReconcileControls& ctrl)
+{
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
     geom.isDefined(), "ODTReconcile reconcile requires defined geometry");
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -294,25 +337,79 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     "ODTReconcile reconcile owner index out of range");
 
   const auto q_target = componentArrayFromCell(owner_cell_average);
-  const auto q_owner = componentArrayFromCell(line_state.cell(owner));
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    isAdmissible(q_target, ctrl),
+    "ODTReconcile reconcile target owner LES mean is not admissible");
 
-  // Mean correction preserving existing subgrid residual shape: shift all
-  // support cells by the same conservative offset required at owner.
-  std::array<amrex::Real, 5> delta{};
-  for (int n = 0; n < 5; ++n) {
-    delta[n] = q_target[n] - q_owner[n];
+  const auto q_owner_old = componentArrayFromCell(line_state.cell(owner));
+
+  // Residual relative to old owner mean at each support cell.
+  std::vector<std::array<amrex::Real, 5>> residuals(
+    static_cast<std::size_t>(line_state.numCells()));
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    const auto qi = componentArrayFromCell(line_state.cell(i));
+    auto& ri = residuals[static_cast<std::size_t>(i)];
+    for (int n = 0; n < 5; ++n) {
+      ri[n] = qi[n] - q_owner_old[n];
+    }
   }
 
-  for (int i = 0; i < line_state.numCells(); ++i) {
-    auto q = componentArrayFromCell(line_state.cell(i));
+  auto make_trial =
+    [&](int i, amrex::Real alpha) -> std::array<amrex::Real, 5> {
+    std::array<amrex::Real, 5> q{};
+    const auto& r = residuals[static_cast<std::size_t>(i)];
     for (int n = 0; n < 5; ++n) {
-      q[n] += delta[n];
+      q[n] = q_target[n] + alpha * r[n];
     }
+    return q;
+  };
 
+  // Uniform residual scaling for admissibility: alpha starts at 1 and is
+  // reduced only if needed.
+  amrex::Real alpha = 1.0;
+  bool admissible = false;
+  for (int iter = 0; iter <= ctrl.max_alpha_reductions; ++iter) {
+    admissible = true;
+    for (int i = 0; i < line_state.numCells(); ++i) {
+      if (!isAdmissible(make_trial(i, alpha), ctrl)) {
+        admissible = false;
+        break;
+      }
+    }
+    if (admissible) {
+      break;
+    }
+    alpha *= 0.5;
+    if (alpha < ctrl.alpha_min) {
+      alpha = 0.0;
+      break;
+    }
+  }
+
+  if (alpha == 0.0) {
+    admissible = true;
+    for (int i = 0; i < line_state.numCells(); ++i) {
+      if (!isAdmissible(q_target, ctrl)) {
+        admissible = false;
+        break;
+      }
+    }
+  }
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    admissible,
+    "ODTReconcile reconcile failed admissibility even after residual scaling");
+
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    const auto q = make_trial(i, alpha);
     ODTLineState::ConservativeCell c{};
     setCellFromComponentArray(c, q);
     line_state.setCell(i, c);
   }
+
+  // Explicit mean treatment: enforce owner exactly after positivity control.
+  ODTLineState::ConservativeCell owner_cell{};
+  setCellFromComponentArray(owner_cell, q_target);
+  line_state.setCell(owner, owner_cell);
 }
 
 } // namespace pelec::odtles

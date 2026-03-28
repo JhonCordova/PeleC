@@ -13,6 +13,13 @@ class ODTReconcile
 {
 public:
   using ConservativeCell = ODTLineState::ConservativeCell;
+  struct ReconcileControls
+  {
+    amrex::Real rho_floor = 1.0e-14;
+    amrex::Real e_floor = 1.0e-12;
+    amrex::Real alpha_min = 1.0e-6;
+    int max_alpha_reductions = 40;
+  };
 
   // First-time LES -> ODT initialization on local support.
   //
@@ -27,13 +34,23 @@ public:
     ODTLineState& line_state);
 
   // Reconcile an existing valid line by enforcing the current owner-cell LES
-  // conservative mean through a profile-wide mean correction.
+  // conservative mean while preserving old subgrid residual content when
+  // admissible:
+  //   trial = target_mean + alpha * old_residual
+  // with alpha starting at 1 and reduced uniformly if needed to satisfy
+  // admissibility floors.
   // This path is distinct from first-time initialization and does not
   // reconstruct/reset the line from scratch.
+  static ReconcileControls defaultReconcileControls();
   static void reconcileExistingLineStateToOwnerAverage(
     const ODTLineGeometry& geom,
     const ConservativeCell& owner_cell_average,
     ODTLineState& line_state);
+  static void reconcileExistingLineStateToOwnerAverage(
+    const ODTLineGeometry& geom,
+    const ConservativeCell& owner_cell_average,
+    ODTLineState& line_state,
+    const ReconcileControls& ctrl);
 };
 
 } // namespace pelec::odtles
