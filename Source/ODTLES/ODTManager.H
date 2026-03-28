@@ -87,6 +87,12 @@ public:
     int dir,
     const amrex::Geometry& geom,
     const amrex::MultiFab& state);
+  ODTLineState& reconcileLineStateToLESState(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom,
+    const amrex::MultiFab& state);
   ODTLineState* findLineState(
     int level,
     const amrex::IntVect& owner_cell,
@@ -111,6 +117,9 @@ private:
   void assertLevelScope(int level) const;
   std::vector<ODTLineState::ConservativeCell> assembleLocalSupportCellAverages(
     const ODTLineGeometry& line_geom,
+    const amrex::MultiFab& state) const;
+  ODTLineState::ConservativeCell getConservativeCellAverageAt(
+    const amrex::IntVect& iv,
     const amrex::MultiFab& state) const;
   ODTLineState& initializeLineStateFromLESSupportAverages(
     int level,

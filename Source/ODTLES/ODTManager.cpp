@@ -156,6 +156,34 @@ ODTManager::initializeLineStateFromLESState(
     level, owner_cell, dir, geom, local_support_cell_averages);
 }
 
+ODTLineState&
+ODTManager::reconcileLineStateToLESState(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  const amrex::MultiFab& state)
+{
+  assertLevelScope(level);
+  auto* entry = findLineEntry(level, owner_cell, dir);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    entry != nullptr,
+    "ODTManager reconcile requires an existing persistent line entry");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    entry->state.initialized() && entry->state.valid(),
+    "ODTManager reconcile requires an existing valid line state");
+  AMREX_ALWAYS_ASSERT(entry->geometry.isDefined());
+  AMREX_ALWAYS_ASSERT(entry->geometry.level() == level);
+  AMREX_ALWAYS_ASSERT(entry->geometry.ownerCell() == owner_cell);
+  AMREX_ALWAYS_ASSERT(entry->geometry.dir() == dir);
+  amrex::ignore_unused(geom);
+
+  const auto owner_avg = getConservativeCellAverageAt(owner_cell, state);
+  ODTReconcile::reconcileExistingLineStateToOwnerAverage(
+    entry->geometry, owner_avg, entry->state);
+  return entry->state;
+}
+
 std::vector<ODTLineState::ConservativeCell>
 ODTManager::assembleLocalSupportCellAverages(
   const ODTLineGeometry& line_geom,
@@ -175,29 +203,8 @@ ODTManager::assembleLocalSupportCellAverages(
     const auto& seg = support[static_cast<std::size_t>(i)];
     amrex::IntVect iv = owner;
     iv[dir] = seg.host_cell_index;
-
-    bool found = false;
-    for (amrex::MFIter mfi(state, false); mfi.isValid(); ++mfi) {
-      const amrex::Box vbx = mfi.validbox();
-      if (!vbx.contains(iv)) {
-        continue;
-      }
-
-      const auto arr = state.const_array(mfi);
-      auto& c = local_support_cell_averages[static_cast<std::size_t>(i)];
-      c.rho = arr(iv, URHO);
-      c.rhou = arr(iv, UMX);
-      c.rhov = arr(iv, UMY);
-      c.rhow = arr(iv, UMZ);
-      c.rhoE = arr(iv, UEDEN);
-      found = true;
-      break;
-    }
-
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-      found,
-      "ODTManager support-cell average assembly requires valid LES cell "
-      "ownership (ghost values are not accepted as physical means)");
+    local_support_cell_averages[static_cast<std::size_t>(i)] =
+      getConservativeCellAverageAt(iv, state);
   }
 
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -206,6 +213,36 @@ ODTManager::assembleLocalSupportCellAverages(
     "ODTManager support-cell average assembly size mismatch");
 
   return local_support_cell_averages;
+}
+
+ODTLineState::ConservativeCell
+ODTManager::getConservativeCellAverageAt(
+  const amrex::IntVect& iv,
+  const amrex::MultiFab& state) const
+{
+  ODTLineState::ConservativeCell c{};
+  bool found = false;
+  for (amrex::MFIter mfi(state, false); mfi.isValid(); ++mfi) {
+    const amrex::Box vbx = mfi.validbox();
+    if (!vbx.contains(iv)) {
+      continue;
+    }
+
+    const auto arr = state.const_array(mfi);
+    c.rho = arr(iv, URHO);
+    c.rhou = arr(iv, UMX);
+    c.rhov = arr(iv, UMY);
+    c.rhow = arr(iv, UMZ);
+    c.rhoE = arr(iv, UEDEN);
+    found = true;
+    break;
+  }
+
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    found,
+    "ODTManager requires valid LES cell ownership (ghost values are not "
+    "accepted as physical means)");
+  return c;
 }
 
 ODTLineState&

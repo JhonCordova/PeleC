@@ -99,6 +99,12 @@ setCellFromComponentArray(
   cell.rhoE = v[4];
 }
 
+std::array<amrex::Real, 5>
+componentArrayFromCell(const ODTLineState::ConservativeCell& c)
+{
+  return {c.rho, c.rhou, c.rhov, c.rhow, c.rhoE};
+}
+
 } // namespace
 
 void
@@ -263,6 +269,50 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
   // Owner interval is centered at s=0, so linear reconstruction preserves the
   // owner LES average exactly over the owner segment.
   line_state.setValid(true);
+}
+
+void
+ODTReconcile::reconcileExistingLineStateToOwnerAverage(
+  const ODTLineGeometry& geom,
+  const ConservativeCell& owner_cell_average,
+  ODTLineState& line_state)
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    geom.isDefined(), "ODTReconcile reconcile requires defined geometry");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    line_state.initialized() && line_state.valid(),
+    "ODTReconcile reconcile requires an existing valid line state");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    line_state.numCells() == geom.supportCellCount(),
+    "ODTReconcile reconcile requires state/geometry support-size consistency");
+
+  const int owner = geom.ownerLocalOrdinal();
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    owner >= 0, "ODTReconcile reconcile requires owner segment in support");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    owner < line_state.numCells(),
+    "ODTReconcile reconcile owner index out of range");
+
+  const auto q_target = componentArrayFromCell(owner_cell_average);
+  const auto q_owner = componentArrayFromCell(line_state.cell(owner));
+
+  // Mean correction preserving existing subgrid residual shape: shift all
+  // support cells by the same conservative offset required at owner.
+  std::array<amrex::Real, 5> delta{};
+  for (int n = 0; n < 5; ++n) {
+    delta[n] = q_target[n] - q_owner[n];
+  }
+
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    auto q = componentArrayFromCell(line_state.cell(i));
+    for (int n = 0; n < 5; ++n) {
+      q[n] += delta[n];
+    }
+
+    ODTLineState::ConservativeCell c{};
+    setCellFromComponentArray(c, q);
+    line_state.setCell(i, c);
+  }
 }
 
 } // namespace pelec::odtles

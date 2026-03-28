@@ -25,6 +25,15 @@ public:
     const ODTLineGeometry& geom,
     const std::vector<ConservativeCell>& local_support_cell_averages,
     ODTLineState& line_state);
+
+  // Reconcile an existing valid line by enforcing the current owner-cell LES
+  // conservative mean through a profile-wide mean correction.
+  // This path is distinct from first-time initialization and does not
+  // reconstruct/reset the line from scratch.
+  static void reconcileExistingLineStateToOwnerAverage(
+    const ODTLineGeometry& geom,
+    const ConservativeCell& owner_cell_average,
+    ODTLineState& line_state);
 };
 
 } // namespace pelec::odtles
