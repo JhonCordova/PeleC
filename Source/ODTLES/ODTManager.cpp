@@ -21,6 +21,12 @@ ODTManager::initializeLevel(
 {
   static_cast<void>(grids);
   static_cast<void>(dmap);
+  if (m_initialized) {
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      level == m_level,
+      "ODTManager::initializeLevel called with a different level than the "
+      "already initialized level");
+  }
   m_level = level;
   m_initialized = true;
 }
@@ -28,10 +34,68 @@ ODTManager::initializeLevel(
 void
 ODTManager::clear()
 {
-  m_line_geometries.clear();
-  m_line_states.clear();
+  m_line_entries.clear();
   m_initialized = false;
   m_level = -1;
+}
+
+bool
+ODTManager::hasLineEntry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir) const
+{
+  return findLineEntry(level, owner_cell, dir) != nullptr;
+}
+
+ODTManager::LineEntry*
+ODTManager::findLineEntry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir)
+{
+  assertLevelScope(level);
+  const LineKey key{level, owner_cell, dir};
+  const auto it = m_line_entries.find(key);
+  return (it == m_line_entries.end()) ? nullptr : &it->second;
+}
+
+const ODTManager::LineEntry*
+ODTManager::findLineEntry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir) const
+{
+  assertLevelScope(level);
+  const LineKey key{level, owner_cell, dir};
+  const auto it = m_line_entries.find(key);
+  return (it == m_line_entries.end()) ? nullptr : &it->second;
+}
+
+ODTManager::LineEntry&
+ODTManager::getOrCreateLineEntry(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom)
+{
+  assertLevelScope(level);
+  const LineKey key{level, owner_cell, dir};
+  auto it_inserted_pair = m_line_entries.emplace(key, LineEntry{});
+  auto it = it_inserted_pair.first;
+  if (it_inserted_pair.second) {
+    it->second.geometry.define(geom, level, owner_cell, dir);
+    it->second.state.initialize(it->second.geometry);
+  } else {
+    AMREX_ALWAYS_ASSERT(it->second.geometry.isDefined());
+    AMREX_ALWAYS_ASSERT(it->second.geometry.level() == level);
+    AMREX_ALWAYS_ASSERT(it->second.geometry.ownerCell() == owner_cell);
+    AMREX_ALWAYS_ASSERT(it->second.geometry.dir() == dir);
+    AMREX_ALWAYS_ASSERT(it->second.state.initialized());
+    AMREX_ALWAYS_ASSERT(
+      it->second.state.numCells() == it->second.geometry.supportCellCount());
+  }
+  return it->second;
 }
 
 ODTLineGeometry&
@@ -41,16 +105,7 @@ ODTManager::getOrCreateLineGeometry(
   int dir,
   const amrex::Geometry& geom)
 {
-  const LineKey key{level, owner_cell, dir};
-  auto it = m_line_geometries.find(key);
-  if (it == m_line_geometries.end()) {
-    it =
-      m_line_geometries.emplace(key, ODTLineGeometry(geom, level, owner_cell, dir))
-        .first;
-  } else {
-    it->second.define(geom, level, owner_cell, dir);
-  }
-  return it->second;
+  return getOrCreateLineEntry(level, owner_cell, dir, geom).geometry;
 }
 
 ODTLineGeometry*
@@ -59,9 +114,8 @@ ODTManager::findLineGeometry(
   const amrex::IntVect& owner_cell,
   int dir)
 {
-  const LineKey key{level, owner_cell, dir};
-  const auto it = m_line_geometries.find(key);
-  return (it == m_line_geometries.end()) ? nullptr : &it->second;
+  auto* entry = findLineEntry(level, owner_cell, dir);
+  return entry == nullptr ? nullptr : &entry->geometry;
 }
 
 const ODTLineGeometry*
@@ -70,9 +124,8 @@ ODTManager::findLineGeometry(
   const amrex::IntVect& owner_cell,
   int dir) const
 {
-  const LineKey key{level, owner_cell, dir};
-  const auto it = m_line_geometries.find(key);
-  return (it == m_line_geometries.end()) ? nullptr : &it->second;
+  const auto* entry = findLineEntry(level, owner_cell, dir);
+  return entry == nullptr ? nullptr : &entry->geometry;
 }
 
 ODTLineState&
@@ -80,24 +133,9 @@ ODTManager::getOrCreateLineState(
   int level,
   const amrex::IntVect& owner_cell,
   int dir,
-  const ODTLineGeometry& geom)
+  const amrex::Geometry& geom)
 {
-  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    geom.isDefined(), "ODTManager::getOrCreateLineState requires defined geometry");
-  AMREX_ALWAYS_ASSERT(geom.level() == level);
-  AMREX_ALWAYS_ASSERT(geom.ownerCell() == owner_cell);
-  AMREX_ALWAYS_ASSERT(geom.dir() == dir);
-
-  const LineKey key{level, owner_cell, dir};
-  auto it_inserted_pair = m_line_states.emplace(key, ODTLineState{});
-  auto it = it_inserted_pair.first;
-  if (
-    it_inserted_pair.second ||
-    !it->second.initialized() ||
-    it->second.numCells() != geom.supportCellCount()) {
-    it->second.initialize(geom);
-  }
-  return it->second;
+  return getOrCreateLineEntry(level, owner_cell, dir, geom).state;
 }
 
 ODTLineState*
@@ -106,9 +144,8 @@ ODTManager::findLineState(
   const amrex::IntVect& owner_cell,
   int dir)
 {
-  const LineKey key{level, owner_cell, dir};
-  const auto it = m_line_states.find(key);
-  return (it == m_line_states.end()) ? nullptr : &it->second;
+  auto* entry = findLineEntry(level, owner_cell, dir);
+  return entry == nullptr ? nullptr : &entry->state;
 }
 
 const ODTLineState*
@@ -117,9 +154,8 @@ ODTManager::findLineState(
   const amrex::IntVect& owner_cell,
   int dir) const
 {
-  const LineKey key{level, owner_cell, dir};
-  const auto it = m_line_states.find(key);
-  return (it == m_line_states.end()) ? nullptr : &it->second;
+  const auto* entry = findLineEntry(level, owner_cell, dir);
+  return entry == nullptr ? nullptr : &entry->state;
 }
 
 bool
@@ -142,6 +178,17 @@ ODTManager::LineKey::operator<(const LineKey& other) const noexcept
   }
 #endif
   return dir < other.dir;
+}
+
+void
+ODTManager::assertLevelScope(int level) const
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    m_initialized,
+    "ODTManager persistent access requires initializeLevel() first");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    level == m_level,
+    "ODTManager is level-local; mixed-level access is not allowed");
 }
 
 } // namespace pelec::odtles

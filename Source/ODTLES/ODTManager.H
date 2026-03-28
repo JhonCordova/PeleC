@@ -19,6 +19,12 @@ namespace pelec::odtles
 class ODTManager
 {
 public:
+  struct LineEntry
+  {
+    ODTLineGeometry geometry;
+    ODTLineState state;
+  };
+
   ODTManager() = default;
   explicit ODTManager(const ODTParams& params);
 
@@ -34,6 +40,19 @@ public:
 
   void clear();
 
+  bool hasLineEntry(int level, const amrex::IntVect& owner_cell, int dir) const;
+  LineEntry*
+  findLineEntry(int level, const amrex::IntVect& owner_cell, int dir);
+  const LineEntry*
+  findLineEntry(int level, const amrex::IntVect& owner_cell, int dir) const;
+  LineEntry& getOrCreateLineEntry(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom);
+
+  std::size_t numLineEntries() const noexcept { return m_line_entries.size(); }
+
   ODTLineGeometry& getOrCreateLineGeometry(
     int level,
     const amrex::IntVect& owner_cell,
@@ -48,7 +67,7 @@ public:
 
   std::size_t numLineGeometries() const noexcept
   {
-    return m_line_geometries.size();
+    return m_line_entries.size();
   }
 
   ODTLineState&
@@ -56,7 +75,7 @@ public:
     int level,
     const amrex::IntVect& owner_cell,
     int dir,
-    const ODTLineGeometry& geom);
+    const amrex::Geometry& geom);
   ODTLineState* findLineState(
     int level,
     const amrex::IntVect& owner_cell,
@@ -66,7 +85,7 @@ public:
     const amrex::IntVect& owner_cell,
     int dir) const;
 
-  std::size_t numLineStates() const noexcept { return m_line_states.size(); }
+  std::size_t numLineStates() const noexcept { return m_line_entries.size(); }
 
 private:
   struct LineKey
@@ -78,11 +97,12 @@ private:
     bool operator<(const LineKey& other) const noexcept;
   };
 
+  void assertLevelScope(int level) const;
+
   ODTParams m_params{};
   bool m_initialized = false;
   int m_level = -1;
-  std::map<LineKey, ODTLineGeometry> m_line_geometries;
-  std::map<LineKey, ODTLineState> m_line_states;
+  std::map<LineKey, LineEntry> m_line_entries;
 };
 
 } // namespace pelec::odtles
