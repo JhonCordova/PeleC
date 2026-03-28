@@ -52,7 +52,11 @@ public:
   }
 
   ODTLineState&
-  getOrCreateLineState(int level, const amrex::IntVect& owner_cell, int dir);
+  getOrCreateLineState(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const ODTLineGeometry& geom);
   ODTLineState* findLineState(
     int level,
     const amrex::IntVect& owner_cell,

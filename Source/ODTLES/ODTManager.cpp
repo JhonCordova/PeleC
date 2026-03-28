@@ -1,5 +1,7 @@
 #include "ODTManager.H"
 
+#include <AMReX.H>
+
 namespace pelec::odtles
 {
 
@@ -77,15 +79,23 @@ ODTLineState&
 ODTManager::getOrCreateLineState(
   int level,
   const amrex::IntVect& owner_cell,
-  int dir)
+  int dir,
+  const ODTLineGeometry& geom)
 {
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    geom.isDefined(), "ODTManager::getOrCreateLineState requires defined geometry");
+  AMREX_ALWAYS_ASSERT(geom.level() == level);
+  AMREX_ALWAYS_ASSERT(geom.ownerCell() == owner_cell);
+  AMREX_ALWAYS_ASSERT(geom.dir() == dir);
+
   const LineKey key{level, owner_cell, dir};
-  auto it_inserted_pair =
-    m_line_states.emplace(key, ODTLineState(owner_cell, dir));
+  auto it_inserted_pair = m_line_states.emplace(key, ODTLineState{});
   auto it = it_inserted_pair.first;
-  const bool inserted = it_inserted_pair.second;
-  if (!inserted && !it->second.valid()) {
-    it->second = ODTLineState(owner_cell, dir);
+  if (
+    it_inserted_pair.second ||
+    !it->second.initialized() ||
+    it->second.numCells() != geom.supportCellCount()) {
+    it->second.initialize(geom);
   }
   return it->second;
 }
