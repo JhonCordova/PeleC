@@ -36,6 +36,8 @@ CEXE_sources += ODTLineState.cpp
 CEXE_sources += ODTLineGeometry.cpp
 CEXE_sources += ODTReconcile.cpp
 CEXE_sources += ODTDiffusion.cpp
+CEXE_sources += ODTKernel.cpp
+CEXE_sources += ODTTripletMap.cpp
 
 #C++ headers
 CEXE_headers += PeleC.H
@@ -68,6 +70,8 @@ CEXE_headers += ODTLineState.H
 CEXE_headers += ODTLineGeometry.H
 CEXE_headers += ODTReconcile.H
 CEXE_headers += ODTDiffusion.H
+CEXE_headers += ODTKernel.H
+CEXE_headers += ODTTripletMap.H
 
 ifeq ($(USE_PARTICLES), TRUE)
   CEXE_sources += Particle.cpp
