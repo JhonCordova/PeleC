@@ -3,11 +3,13 @@
 
 #include <cstddef>
 #include <map>
+#include <vector>
 
 #include <AMReX_BoxArray.H>
 #include <AMReX_DistributionMapping.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_IntVect.H>
+#include <AMReX_MultiFab.H>
 
 #include "ODTLineGeometry.H"
 #include "ODTLineState.H"
@@ -76,6 +78,15 @@ public:
     const amrex::IntVect& owner_cell,
     int dir,
     const amrex::Geometry& geom);
+  // Host-side input-contract path: assemble local support-cell conservative
+  // means directly from valid LES cells in state and initialize first-time
+  // line state.
+  ODTLineState& initializeLineStateFromLESState(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom,
+    const amrex::MultiFab& state);
   ODTLineState* findLineState(
     int level,
     const amrex::IntVect& owner_cell,
@@ -98,6 +109,16 @@ private:
   };
 
   void assertLevelScope(int level) const;
+  std::vector<ODTLineState::ConservativeCell> assembleLocalSupportCellAverages(
+    const ODTLineGeometry& line_geom,
+    const amrex::MultiFab& state) const;
+  ODTLineState& initializeLineStateFromLESSupportAverages(
+    int level,
+    const amrex::IntVect& owner_cell,
+    int dir,
+    const amrex::Geometry& geom,
+    const std::vector<ODTLineState::ConservativeCell>&
+      local_support_cell_averages);
 
   ODTParams m_params{};
   bool m_initialized = false;

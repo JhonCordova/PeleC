@@ -2,6 +2,9 @@
 
 #include <AMReX.H>
 
+#include "IndexDefines.H"
+#include "ODTReconcile.H"
+
 namespace pelec::odtles
 {
 
@@ -136,6 +139,90 @@ ODTManager::getOrCreateLineState(
   const amrex::Geometry& geom)
 {
   return getOrCreateLineEntry(level, owner_cell, dir, geom).state;
+}
+
+ODTLineState&
+ODTManager::initializeLineStateFromLESState(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  const amrex::MultiFab& state)
+{
+  auto& entry = getOrCreateLineEntry(level, owner_cell, dir, geom);
+  const auto local_support_cell_averages =
+    assembleLocalSupportCellAverages(entry.geometry, state);
+  return initializeLineStateFromLESSupportAverages(
+    level, owner_cell, dir, geom, local_support_cell_averages);
+}
+
+std::vector<ODTLineState::ConservativeCell>
+ODTManager::assembleLocalSupportCellAverages(
+  const ODTLineGeometry& line_geom,
+  const amrex::MultiFab& state) const
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    line_geom.isDefined(),
+    "ODTManager::assembleLocalSupportCellAverages requires defined geometry");
+
+  const auto& support = line_geom.supportCells();
+  std::vector<ODTLineState::ConservativeCell> local_support_cell_averages(
+    support.size());
+  const amrex::IntVect owner = line_geom.ownerCell();
+  const int dir = line_geom.dir();
+
+  for (int i = 0; i < static_cast<int>(support.size()); ++i) {
+    const auto& seg = support[static_cast<std::size_t>(i)];
+    amrex::IntVect iv = owner;
+    iv[dir] = seg.host_cell_index;
+
+    bool found = false;
+    for (amrex::MFIter mfi(state, false); mfi.isValid(); ++mfi) {
+      const amrex::Box vbx = mfi.validbox();
+      if (!vbx.contains(iv)) {
+        continue;
+      }
+
+      const auto arr = state.const_array(mfi);
+      auto& c = local_support_cell_averages[static_cast<std::size_t>(i)];
+      c.rho = arr(iv, URHO);
+      c.rhou = arr(iv, UMX);
+      c.rhov = arr(iv, UMY);
+      c.rhow = arr(iv, UMZ);
+      c.rhoE = arr(iv, UEDEN);
+      found = true;
+      break;
+    }
+
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      found,
+      "ODTManager support-cell average assembly requires valid LES cell "
+      "ownership (ghost values are not accepted as physical means)");
+  }
+
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    static_cast<int>(local_support_cell_averages.size()) ==
+      line_geom.supportCellCount(),
+    "ODTManager support-cell average assembly size mismatch");
+
+  return local_support_cell_averages;
+}
+
+ODTLineState&
+ODTManager::initializeLineStateFromLESSupportAverages(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  const std::vector<ODTLineState::ConservativeCell>&
+    local_support_cell_averages)
+{
+  auto& entry = getOrCreateLineEntry(level, owner_cell, dir, geom);
+  if (!entry.state.valid()) {
+    ODTReconcile::initializeLineStateFromLESSupportAverages(
+      entry.geometry, local_support_cell_averages, entry.state);
+  }
+  return entry.state;
 }
 
 ODTLineState*
