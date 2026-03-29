@@ -86,10 +86,16 @@ include(SetAmrexCompileFlags)
 
 message(STATUS "SUNDIALS Configure Section")
 set(SUNDIALS_SUBMOD_LOCATION "${CMAKE_SOURCE_DIR}/Submodules/PelePhysics/Submodules/sundials")
+# Preserve PeleC's test-workflow gate before SUNDIALS options mutate
+# BUILD_TESTING for submodule configuration.
+set(PELEC_BUILD_TESTING ${BUILD_TESTING})
 include(SetSundialsOptions)
 #BUILD_TESTING is an old CMake keyword so don't clear it in sundials configure
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 add_subdirectory(${SUNDIALS_SUBMOD_LOCATION})
+# Restore top-level BUILD_TESTING so Exec/UnitTests and CTest registration
+# remain controlled by the user-provided PeleC configuration.
+set(BUILD_TESTING ${PELEC_BUILD_TESTING} CACHE BOOL "Enable PeleC tests" FORCE)
 
 ########################### MASA #####################################
 
