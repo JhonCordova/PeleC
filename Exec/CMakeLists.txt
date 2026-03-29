@@ -1,3 +1,5 @@
 add_subdirectory(RegTests)
-#add_subdirectory(UnitTests)
+if(BUILD_TESTING)
+  add_subdirectory(UnitTests)
+endif()
 #add_subdirectory(Production)
