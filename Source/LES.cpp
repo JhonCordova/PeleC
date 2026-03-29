@@ -48,6 +48,7 @@
 //     justified.
 
 #include "LES.H"
+#include "ODTStepper.H"
 
 void
 PeleC::construct_old_les_source(
@@ -195,6 +196,11 @@ PeleC::getODTLESTerm(
   long rejected_amr_entries = 0;
   long rejected_invalid_entries = 0;
   long rejected_mixed_entries = 0;
+  long stepped_entries = 0;
+  long stepper_attempted_events = 0;
+  long stepper_applied_events = 0;
+  long stepper_rejected_events = 0;
+  long stepper_diffusion_only_catchup = 0;
 
   for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
     const amrex::Box& vbx = mfi.validbox();
@@ -245,6 +251,38 @@ PeleC::getODTLESTerm(
           odt_manager.initializeLineStateFromSupportData(
             level, iv, dir, geom, support_data);
         }
+
+        auto* stepped_entry = odt_manager.findLineEntry(level, iv, dir);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          stepped_entry != nullptr && stepped_entry->state.valid(),
+          "ODTLES runtime expected a valid persistent line before local stepping");
+
+        pelec::odtles::ODTStepper::Controls step_ctrl{};
+        step_ctrl.max_internal_iterations =
+          odt_manager.params().max_local_substeps > 0
+            ? odt_manager.params().max_local_substeps
+            : 1;
+        step_ctrl.sampler_controls.deterministic = true;
+        step_ctrl.sampler_controls.seed = static_cast<std::uint64_t>(
+          (static_cast<unsigned>(level) + 1U) * 73856093U ^
+          (static_cast<unsigned>(dir) + 1U) * 19349663U ^
+          (static_cast<unsigned>(iv[0]) + 1U) * 83492791U ^
+          (static_cast<unsigned>(iv[1]) + 1U) * 2654435761U ^
+          (static_cast<unsigned>(iv[2]) + 1U) * 97531U);
+
+        const auto step_rep = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+          stepped_entry->geometry, stepped_entry->state, dt, step_ctrl);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          step_rep.reached_dt_les,
+          "ODTLES local stepper failed to close dt_LES exactly");
+
+        ++stepped_entries;
+        stepper_attempted_events += step_rep.attempted_events;
+        stepper_applied_events += step_rep.applied_events;
+        stepper_rejected_events += step_rep.rejected_events;
+        if (step_rep.closed_by_diffusion_only_catchup) {
+          ++stepper_diffusion_only_catchup;
+        }
       }
     }
   }
@@ -259,6 +297,15 @@ PeleC::getODTLESTerm(
       << ", amr_coarse_fine=" << rejected_amr_entries
       << ", invalid=" << rejected_invalid_entries
       << ", mixed=" << rejected_mixed_entries << "]" << std::endl;
+  }
+  if (verbose != 0 && stepped_entries > 0) {
+    amrex::Print() << "ODTLES: stepped " << stepped_entries
+                   << " local lines over dt_LES with neutral SGS return. "
+                   << "[attempted_events=" << stepper_attempted_events
+                   << ", applied_events=" << stepper_applied_events
+                   << ", rejected_events=" << stepper_rejected_events
+                   << ", diffusion_only_catchup_entries="
+                   << stepper_diffusion_only_catchup << "]" << std::endl;
   }
 
   LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());

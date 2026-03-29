@@ -38,6 +38,8 @@ CEXE_sources += ODTReconcile.cpp
 CEXE_sources += ODTDiffusion.cpp
 CEXE_sources += ODTKernel.cpp
 CEXE_sources += ODTTripletMap.cpp
+CEXE_sources += ODTEventSampler.cpp
+CEXE_sources += ODTStepper.cpp
 
 #C++ headers
 CEXE_headers += PeleC.H
@@ -72,6 +74,8 @@ CEXE_headers += ODTReconcile.H
 CEXE_headers += ODTDiffusion.H
 CEXE_headers += ODTKernel.H
 CEXE_headers += ODTTripletMap.H
+CEXE_headers += ODTEventSampler.H
+CEXE_headers += ODTStepper.H
 
 ifeq ($(USE_PARTICLES), TRUE)
   CEXE_sources += Particle.cpp
