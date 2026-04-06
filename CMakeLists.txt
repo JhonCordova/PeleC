@@ -95,6 +95,7 @@ set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 add_subdirectory(${SUNDIALS_SUBMOD_LOCATION})
 # Restore top-level BUILD_TESTING so Exec/UnitTests and CTest registration
 # remain controlled by the user-provided PeleC configuration.
+set(BUILD_TESTING ${PELEC_BUILD_TESTING})
 set(BUILD_TESTING ${PELEC_BUILD_TESTING} CACHE BOOL "Enable PeleC tests" FORCE)
 
 ########################### MASA #####################################
