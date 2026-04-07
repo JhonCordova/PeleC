@@ -48,6 +48,7 @@
 //     justified.
 
 #include "LES.H"
+#include "ODTMomentExtractor.H"
 #include "ODTStepper.H"
 
 void
@@ -201,6 +202,7 @@ PeleC::getODTLESTerm(
   long stepper_applied_events = 0;
   long stepper_rejected_events = 0;
   long stepper_diffusion_only_catchup = 0;
+  long moment_columns_built = 0;
 
   for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
     const amrex::Box& vbx = mfi.validbox();
@@ -276,6 +278,21 @@ PeleC::getODTLESTerm(
           step_rep.reached_dt_les,
           "ODTLES local stepper failed to close dt_LES exactly");
 
+        const auto moment_column =
+          pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+            stepped_entry->geometry, stepped_entry->state);
+        const auto momentum_sgs_intermediate =
+          pelec::odtles::ODTMomentExtractor::buildDirectionalMomentumContribution(
+            moment_column);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          momentum_sgs_intermediate.valid &&
+            momentum_sgs_intermediate.dir == dir,
+          "ODTLES directional SGS intermediate metadata mismatch");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          momentum_sgs_intermediate.q[3] == 0.0,
+          "ODTLES directional SGS intermediate must keep UEDEN inactive");
+        ++moment_columns_built;
+
         ++stepped_entries;
         stepper_attempted_events += step_rep.attempted_events;
         stepper_applied_events += step_rep.applied_events;
@@ -304,8 +321,10 @@ PeleC::getODTLESTerm(
                    << "[attempted_events=" << stepper_attempted_events
                    << ", applied_events=" << stepper_applied_events
                    << ", rejected_events=" << stepper_rejected_events
-                   << ", diffusion_only_catchup_entries="
-                   << stepper_diffusion_only_catchup << "]" << std::endl;
+                    << ", diffusion_only_catchup_entries="
+                   << stepper_diffusion_only_catchup
+                   << ", directional_momentum_columns="
+                   << moment_columns_built << "]" << std::endl;
   }
 
   LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());

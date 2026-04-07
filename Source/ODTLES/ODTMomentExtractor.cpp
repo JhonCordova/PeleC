@@ -126,6 +126,29 @@ ODTMomentExtractor::extractDirectionalMomentumColumn(
   return out;
 }
 
+ODTMomentExtractor::DirectionalMomentumContribution
+ODTMomentExtractor::buildDirectionalMomentumContribution(
+  const DirectionalColumn& column)
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    column.valid,
+    "ODTMomentExtractor directional contribution requires a valid moment "
+    "column");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    column.dir >= 0 && column.dir < AMREX_SPACEDIM,
+    "ODTMomentExtractor directional contribution requires a valid line "
+    "direction");
+
+  DirectionalMomentumContribution out{};
+  out.dir = column.dir;
+  out.q[0] = -column.tau_ij[0];
+  out.q[1] = -column.tau_ij[1];
+  out.q[2] = -column.tau_ij[2];
+  out.q[3] = 0.0; // Explicitly inactive UEDEN placeholder at this stage.
+  out.valid = true;
+  return out;
+}
+
 ODTMomentExtractor::ValidationReport
 ODTMomentExtractor::runMVPValidationHook()
 {

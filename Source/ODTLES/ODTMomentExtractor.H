@@ -46,6 +46,16 @@ public:
     amrex::Real tau_max_abs = 0.0;
   };
 
+  struct DirectionalMomentumContribution
+  {
+    // Fixed line direction j carried explicitly for downstream mapping.
+    int dir = -1;
+    bool valid = false;
+    // Layout-compatible momentum/energy-like slots:
+    // [UMX, UMY, UMZ, UEDEN], with UEDEN intentionally inactive for now.
+    std::array<amrex::Real, 4> q{{0.0, 0.0, 0.0, 0.0}};
+  };
+
   // Extract directional momentum moments from the owner-cell central interval.
   //
   // Discrete averaging uses geometric overlap weights over support segments:
@@ -62,6 +72,14 @@ public:
   static DirectionalColumn extractDirectionalMomentumColumn(
     const ODTLineGeometry& geom,
     const ODTLineState& line_state);
+
+  // Build directional intermediate momentum SGS contribution from tau_ij
+  // for fixed line direction j:
+  //   q = [-tau_1j, -tau_2j, -tau_3j, 0]
+  // This is a cell-centered intermediate representation only; no face mapping,
+  // area scaling, divergence assembly, or LESTerm deposition is performed here.
+  static DirectionalMomentumContribution buildDirectionalMomentumContribution(
+    const DirectionalColumn& column);
 
   // Lightweight validation hook for overlap-weighted central extraction:
   // checks partition-of-unity weights and owner-central recovery behavior.

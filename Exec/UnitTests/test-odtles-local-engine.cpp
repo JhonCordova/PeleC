@@ -69,4 +69,22 @@ TEST(ODTLESLocalEngine, MomentExtractorMVPValidation)
   EXPECT_LE(rep.tau_max_abs, tol);
 }
 
+TEST(ODTLESLocalEngine, DirectionalMomentumContributionLayout)
+{
+  pelec::odtles::ODTMomentExtractor::DirectionalColumn col{};
+  col.dir = 2;
+  col.valid = true;
+  col.tau_ij = {1.5, -2.0, 0.25};
+
+  const auto q =
+    pelec::odtles::ODTMomentExtractor::buildDirectionalMomentumContribution(col);
+
+  EXPECT_TRUE(q.valid);
+  EXPECT_EQ(q.dir, 2);
+  EXPECT_DOUBLE_EQ(q.q[0], -1.5);
+  EXPECT_DOUBLE_EQ(q.q[1], 2.0);
+  EXPECT_DOUBLE_EQ(q.q[2], -0.25);
+  EXPECT_DOUBLE_EQ(q.q[3], 0.0);
+}
+
 } // namespace pelec_tests
