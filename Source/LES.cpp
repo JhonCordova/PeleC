@@ -163,11 +163,11 @@ PeleC::getODTLESTerm(
   amrex::MultiFab& LESTerm,
   amrex::Real reflux_factor)
 {
-  amrex::ignore_unused(dt, reflux_factor);
-
-  // ODT runtime hookup (T4): host-side LES->ODT preparation only.
-  // This updates persistent local line state via first-time init/reconcile
-  // and keeps SGS return neutral until ODT stepping/extraction are added.
+  // ODT runtime hookup:
+  // 1) prepare/reconcile local lines,
+  // 2) advance each line over host-owned dt_LES,
+  // 3) extract directional SGS momentum moments and map to directional face
+  //    fluxes, then use standard PeleC conservative divergence assembly.
   odt_manager.initializeLevel(level, grids, dmap);
 
   constexpr int support_ng =
@@ -192,6 +192,21 @@ PeleC::getODTLESTerm(
   amrex::MultiFab state_host_filled(
     grids, dmap, NVAR, support_ng, amrex::MFInfo(), Factory());
   FillPatch(*this, state_host_filled, support_ng, time, State_Type, 0, NVAR);
+
+  // Cell-centered directional intermediate from ODT for each fixed line
+  // direction j. Component layout:
+  //   [0]=UMX contribution = -tau_1j
+  //   [1]=UMY contribution = -tau_2j
+  //   [2]=UMZ contribution = -tau_3j
+  //   [3]=UEDEN placeholder = 0 (inactive in this phase)
+  constexpr int odt_flux_ncomp =
+    pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::NumComponents;
+  amrex::Array<amrex::MultiFab, AMREX_SPACEDIM> odt_dir_cc;
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    odt_dir_cc[dir].define(
+      grids, dmap, odt_flux_ncomp, 1, amrex::MFInfo(), Factory());
+    odt_dir_cc[dir].setVal(0.0, 0, odt_flux_ncomp, odt_dir_cc[dir].nGrow());
+  }
 
   long rejected_boundary_entries = 0;
   long rejected_amr_entries = 0;
@@ -289,8 +304,14 @@ PeleC::getODTLESTerm(
             momentum_sgs_intermediate.dir == dir,
           "ODTLES directional SGS intermediate metadata mismatch");
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          momentum_sgs_intermediate.q[3] == 0.0,
+          momentum_sgs_intermediate.q[pelec::odtles::ODTMomentExtractor::
+                                         DirectionalMomentumContribution::Ueden] == 0.0,
           "ODTLES directional SGS intermediate must keep UEDEN inactive");
+
+        auto const& dir_cc = odt_dir_cc[dir].array(mfi);
+        for (int n = 0; n < odt_flux_ncomp; ++n) {
+          dir_cc(iv, n) = momentum_sgs_intermediate.q[static_cast<std::size_t>(n)];
+        }
         ++moment_columns_built;
 
         ++stepped_entries;
@@ -327,7 +348,101 @@ PeleC::getODTLESTerm(
                    << moment_columns_built << "]" << std::endl;
   }
 
-  LESTerm.setVal(0.0, 0, NVAR, LESTerm.nGrow());
+  // Fill same-level/periodic ghosts for centered directional intermediates.
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    odt_dir_cc[dir].FillBoundary(geom.periodicity());
+  }
+
+  // Map centered directional ODT SGS contributions to face fluxes in the
+  // matching face-normal direction and then deposit conservatively.
+  // For fixed direction j and momentum component i:
+  //   centered q_i^(j) = -tau_ij
+  //   face flux F_i^(j) = A_j * avg_face(q_i^(j))
+  // with avg_face as arithmetic average between adjacent centered values.
+  // UEDEN is explicitly kept inactive: F_UEDEN^(j)=0.
+  const auto domain = geom.Domain();
+  auto const& fact =
+    dynamic_cast<amrex::EBFArrayBoxFactory const&>(LESTerm.Factory());
+  auto const& flags = fact.getMultiEBCellFlagFab();
+
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+  {
+    for (amrex::MFIter mfi(LESTerm, amrex::TilingIfNotGPU()); mfi.isValid();
+         ++mfi) {
+      const amrex::Box vbox = mfi.tilebox();
+      const amrex::Box cbox = amrex::grow(vbox, 0);
+
+      const auto& flag_fab = flags[mfi];
+      amrex::FabType typ = flag_fab.getType(cbox);
+      if (typ != amrex::FabType::regular) {
+        amrex::Error("LES on a non-regular EB Fab is not available.");
+      }
+      if (typ == amrex::FabType::covered) {
+        continue;
+      }
+
+      const amrex::Array<const amrex::Box, AMREX_SPACEDIM> eboxes = {
+        AMREX_D_DECL(
+          amrex::surroundingNodes(cbox, 0), amrex::surroundingNodes(cbox, 1),
+          amrex::surroundingNodes(cbox, 2))};
+
+      amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> flux_ec;
+      amrex::GpuArray<amrex::Array4<amrex::Real>, AMREX_SPACEDIM> flx;
+      resizeAndSetFlux(eboxes, flx, flux_ec);
+
+      const amrex::GpuArray<
+        const amrex::Array4<const amrex::Real>, AMREX_SPACEDIM>
+        a{{AMREX_D_DECL(
+          area[0].array(mfi), area[1].array(mfi), area[2].array(mfi))}};
+
+      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+        const auto qcc = odt_dir_cc[dir].const_array(mfi);
+        amrex::ParallelFor(
+          eboxes[dir], [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept {
+            const amrex::IntVect iv(AMREX_D_DECL(i, j, k));
+            const amrex::IntVect ivm =
+              iv - amrex::IntVect::TheDimensionVector(dir);
+            const bool has_hi = domain.contains(iv);
+            const bool has_lo = domain.contains(ivm);
+
+            const int il = i - (dir == 0 ? 1 : 0);
+            const int jl = j - (dir == 1 ? 1 : 0);
+            const int kl = k - (dir == 2 ? 1 : 0);
+
+            const auto centered_face_avg = [&](int comp) -> amrex::Real {
+              const amrex::Real q_hi = has_hi ? qcc(i, j, k, comp) : 0.0;
+              const amrex::Real q_lo = has_lo ? qcc(il, jl, kl, comp) : 0.0;
+              if (has_hi && has_lo) {
+                return 0.5 * (q_hi + q_lo);
+              }
+              if (has_hi) {
+                return q_hi;
+              }
+              if (has_lo) {
+                return q_lo;
+              }
+              return 0.0;
+            };
+
+            const amrex::Real area_j = a[dir](i, j, k);
+            flx[dir](i, j, k, UMX) = area_j * centered_face_avg(
+              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomX);
+            flx[dir](i, j, k, UMY) = area_j * centered_face_avg(
+              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomY);
+            flx[dir](i, j, k, UMZ) = area_j * centered_face_avg(
+              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomZ);
+            flx[dir](i, j, k, UEDEN) = 0.0;
+          });
+      }
+
+      computeFluxDiv(LESTerm, mfi, vbox, flx, volume);
+      updateFluxRegistersLES(
+        reflux_factor, LESTerm, dt, mfi, typ,
+        {AMREX_D_DECL(flux_ec.data(), &flux_ec[1], &flux_ec[2])});
+    }
+  }
 }
 
 void

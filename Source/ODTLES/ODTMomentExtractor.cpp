@@ -141,10 +141,11 @@ ODTMomentExtractor::buildDirectionalMomentumContribution(
 
   DirectionalMomentumContribution out{};
   out.dir = column.dir;
-  out.q[0] = -column.tau_ij[0];
-  out.q[1] = -column.tau_ij[1];
-  out.q[2] = -column.tau_ij[2];
-  out.q[3] = 0.0; // Explicitly inactive UEDEN placeholder at this stage.
+  out.q[DirectionalMomentumContribution::MomX] = -column.tau_ij[0];
+  out.q[DirectionalMomentumContribution::MomY] = -column.tau_ij[1];
+  out.q[DirectionalMomentumContribution::MomZ] = -column.tau_ij[2];
+  out.q[DirectionalMomentumContribution::Ueden] =
+    0.0; // Explicitly inactive UEDEN placeholder at this stage.
   out.valid = true;
   return out;
 }

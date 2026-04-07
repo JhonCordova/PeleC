@@ -48,12 +48,18 @@ public:
 
   struct DirectionalMomentumContribution
   {
+    static constexpr int MomX = 0;
+    static constexpr int MomY = 1;
+    static constexpr int MomZ = 2;
+    static constexpr int Ueden = 3;
+    static constexpr int NumComponents = 4;
+
     // Fixed line direction j carried explicitly for downstream mapping.
     int dir = -1;
     bool valid = false;
     // Layout-compatible momentum/energy-like slots:
     // [UMX, UMY, UMZ, UEDEN], with UEDEN intentionally inactive for now.
-    std::array<amrex::Real, 4> q{{0.0, 0.0, 0.0, 0.0}};
+    std::array<amrex::Real, NumComponents> q{{0.0, 0.0, 0.0, 0.0}};
   };
 
   // Extract directional momentum moments from the owner-cell central interval.
