@@ -36,6 +36,20 @@ ODTLineState::initialize(const ODTLineGeometry& geom)
 }
 
 void
+ODTLineState::initializeForValidation(int n_cells)
+{
+  // Test-hook path only: allows validation code to exercise mapping logic on
+  // controlled synthetic line lengths.
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    n_cells > 0,
+    "ODTLineState::initializeForValidation requires a positive cell count");
+
+  m_cells.assign(static_cast<std::size_t>(n_cells), ConservativeCell{});
+  m_valid = false;
+  m_initialized = true;
+}
+
+void
 ODTLineState::reset()
 {
   m_cells.clear();

@@ -1,7 +1,8 @@
 #ifndef PROB_H
 #define PROB_H
 
-#include "ProblemDerive.H"
+#include "PeleC.H"
+#include "ProblemSpecificFunctions.H"
 
 AMREX_GPU_DEVICE
 AMREX_FORCE_INLINE
@@ -91,5 +92,6 @@ struct MyProbDeriveStruct
 void pc_prob_close();
 
 using ProblemDerives = MyProbDeriveStruct;
+using ProblemSpecificFunctions = DefaultProblemSpecificFunctions;
 
 #endif

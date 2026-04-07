@@ -31,6 +31,10 @@ public:
   ODTLineState() = default;
 
   void initialize(const ODTLineGeometry& geom);
+  // Validation-only utility for local MVP hooks.
+  // This intentionally bypasses geometry-derived support construction and
+  // should not be used by runtime ODT integration paths.
+  void initializeForValidation(int n_cells);
   void reset();
   void setValid(bool valid) noexcept { m_valid = valid; }
 

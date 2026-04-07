@@ -5,11 +5,6 @@
 #include <vector>
 
 #include <AMReX.H>
-#include <AMReX_Box.H>
-#include <AMReX_Geometry.H>
-#include <AMReX_IntVect.H>
-#include <AMReX_RealBox.H>
-
 namespace pelec::odtles
 {
 
@@ -135,18 +130,8 @@ ODTTripletMap::runMVPValidationHook()
 {
   ValidationReport report{};
 
-  const amrex::Box domain(
-    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
-    amrex::IntVect(AMREX_D_DECL(5, 0, 0)));
-  amrex::RealBox rb(
-    AMREX_D_DECL(0.0, 0.0, 0.0), AMREX_D_DECL(6.0, 1.0, 1.0));
-  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
-  const amrex::Geometry geom(domain, &rb, 0, is_per);
-  const amrex::IntVect owner(AMREX_D_DECL(3, 0, 0));
-  ODTLineGeometry line_geom(geom, 0, owner, 0);
-
   ODTLineState base_state;
-  base_state.initialize(line_geom);
+  base_state.initializeForValidation(8);
   for (int i = 0; i < base_state.numCells(); ++i) {
     ODTLineState::ConservativeCell c{};
     c.rho = 1.0;
@@ -159,7 +144,20 @@ ODTTripletMap::runMVPValidationHook()
   base_state.setValid(true);
 
   constexpr amrex::Real tol = 1.0e-12;
-  const EddyInterval interval{0, 2}; // n=3 satisfies MVP n=3m policy.
+  const EddyInterval interval{1, 6}; // n=6 (3m) nondegenerate with outside cells.
+  const int n = interval.size();
+
+  bool has_nontrivial_permutation = false;
+  for (int j = 0; j < n; ++j) {
+    if (mappedSourceLocalIndex(j, n) != j) {
+      has_nontrivial_permutation = true;
+      break;
+    }
+  }
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    has_nontrivial_permutation,
+    "Triplet-map MVP validation interval must produce a non-identity "
+    "permutation");
 
   // Uniform invariance under pure permutation.
   ODTLineState uniform_before = base_state;
@@ -203,12 +201,14 @@ ODTTripletMap::runMVPValidationHook()
   report.map_locality_preserved = (report.outside_interval_max_abs_change <= tol);
 
   // Kernel zero-net momentum check over mapped interval.
-  ODTLineState kernel_state = nonuniform_after;
+  // Use a dedicated pre-map state, then apply map+kernel once.
+  ODTLineState kernel_before = nonuniform_before;
+  ODTLineState kernel_state = kernel_before;
   amrex::Real sum_rhou_before = 0.0;
   amrex::Real sum_rhov_before = 0.0;
   amrex::Real sum_rhow_before = 0.0;
   for (int i = interval.i_lo; i <= interval.i_hi; ++i) {
-    const auto& c = kernel_state.cell(i);
+    const auto& c = kernel_before.cell(i);
     sum_rhou_before += c.rhou;
     sum_rhov_before += c.rhov;
     sum_rhow_before += c.rhow;
@@ -219,7 +219,7 @@ ODTTripletMap::runMVPValidationHook()
   kernel.amp_u = 0.3;
   kernel.amp_v = -0.2;
   kernel.amp_w = 0.1;
-  kernel.shape = {0.0, 1.0, 0.0};
+  kernel.shape = {0.0, 1.0, 0.0, 0.0, -1.0, 0.0};
 
   applyPermutationWithKernel(kernel_state, interval, kernel);
 

@@ -7,10 +7,20 @@ set(PELE_PHYSICS_SPRAY_FUEL_NUM 0)
 include(BuildExeAndLib)
 
 target_sources(${pele_exe_name}
-  PUBLIC
+  PRIVATE
   unit-tests-main.cpp
   test-config.cpp
   test-odtles-local-engine.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTDiffusion.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTEventSampler.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTKernel.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTLineGeometry.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTLineState.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTManager.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTParams.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTReconcile.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTStepper.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTTripletMap.cpp
   )
 
 if(PELE_ENABLE_CUDA)
@@ -21,5 +31,5 @@ if(PELE_ENABLE_CUDA)
     PROPERTIES LANGUAGE CUDA)
 endif()
 
-target_include_directories(${pele_exe_name} SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/Submodules/GoogleTest/googletest/include)
-target_link_libraries(${pele_exe_name} PRIVATE gtest)
+find_package(GTest REQUIRED)
+target_link_libraries(${pele_exe_name} PRIVATE GTest::gtest)

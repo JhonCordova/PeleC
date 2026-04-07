@@ -18,6 +18,7 @@ function(build_pele_exe pele_exe_name pele_physics_lib_name)
 
   target_include_directories(${pele_exe_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(${pele_exe_name} PRIVATE ${SRC_DIR})
+  target_include_directories(${pele_exe_name} PRIVATE ${SRC_DIR}/ODTLES)
   target_include_directories(${pele_exe_name} PRIVATE ${CMAKE_BINARY_DIR})
   target_include_directories(${pele_exe_name} PRIVATE ${CMAKE_SOURCE_DIR}/Source/Params/param_includes)
   #Adv and Aux Variables
