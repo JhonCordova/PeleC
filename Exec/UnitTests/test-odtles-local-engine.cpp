@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "ODTDiffusion.H"
+#include "ODTMomentExtractor.H"
 #include "ODTStepper.H"
 #include "ODTTripletMap.H"
 
@@ -53,6 +54,19 @@ TEST(ODTLESLocalEngine, StepperMVPValidation)
 
   EXPECT_LE(rep.closure_error, tol);
   EXPECT_LE(rep.overshoot_amount, tol);
+}
+
+TEST(ODTLESLocalEngine, MomentExtractorMVPValidation)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const auto rep = pelec::odtles::ODTMomentExtractor::runMVPValidationHook();
+
+  EXPECT_TRUE(rep.overlap_weights_partition_unity);
+  EXPECT_TRUE(rep.owner_central_recovered);
+  EXPECT_TRUE(rep.tau_zero_for_single_segment_central_interval);
+  EXPECT_LE(rep.overlap_weight_sum_error, tol);
+  EXPECT_LE(rep.owner_recovery_max_abs_error, tol);
+  EXPECT_LE(rep.tau_max_abs, tol);
 }
 
 } // namespace pelec_tests
