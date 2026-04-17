@@ -49,6 +49,7 @@
 
 #include "LES.H"
 #include "ODTMomentExtractor.H"
+#include "ODTRuntimeLESBridge.H"
 #include "ODTStepper.H"
 
 void
@@ -168,16 +169,9 @@ PeleC::getODTLESTerm(
   // 2) advance each line over host-owned dt_LES,
   // 3) extract directional SGS momentum moments and map to directional face
   //    fluxes, then use standard PeleC conservative divergence assembly.
-  odt_manager.initializeLevel(level, grids, dmap);
-
   constexpr int support_ng =
     (pelec::odtles::ODTLineGeometry::MVPNumSupportCells - 1) / 2;
 
-  // T4 provenance policy:
-  // 1) Build valid level state at requested time.
-  // 2) Build same-level ghost extension via FillBoundary only.
-  // This allows same-level inter-rank/periodic support collection while
-  // explicitly avoiding AMR coarse-fine ghost provenance for support means.
   amrex::MultiFab state_valid(grids, dmap, NVAR, 0, amrex::MFInfo(), Factory());
   FillPatch(*this, state_valid, 0, time, State_Type, 0, NVAR);
 
@@ -186,262 +180,45 @@ PeleC::getODTLESTerm(
   amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
   state_same_level.FillBoundary(geom.periodicity());
 
-  // Only for provenance surfacing: this contains host-filled ghosts that may
-  // include AMR/coarse-fine fill mechanisms. It is not the support source used
-  // by the T4 math path unless policy later accepts that provenance.
   amrex::MultiFab state_host_filled(
     grids, dmap, NVAR, support_ng, amrex::MFInfo(), Factory());
   FillPatch(*this, state_host_filled, support_ng, time, State_Type, 0, NVAR);
 
-  // Cell-centered directional intermediate from ODT for each fixed line
-  // direction j. Component layout:
-  //   [0]=UMX contribution = -tau_1j
-  //   [1]=UMY contribution = -tau_2j
-  //   [2]=UMZ contribution = -tau_3j
-  //   [3]=UEDEN placeholder = 0 (inactive in this phase)
-  constexpr int odt_flux_ncomp =
-    pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::NumComponents;
-  amrex::Array<amrex::MultiFab, AMREX_SPACEDIM> odt_dir_cc;
-  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
-    odt_dir_cc[dir].define(
-      grids, dmap, odt_flux_ncomp, 1, amrex::MFInfo(), Factory());
-    odt_dir_cc[dir].setVal(0.0, 0, odt_flux_ncomp, odt_dir_cc[dir].nGrow());
-  }
+  const amrex::Array<const amrex::MultiFab*, AMREX_SPACEDIM> area_ptr = {
+    AMREX_D_DECL(&area[0], &area[1], &area[2])};
 
-  long rejected_boundary_entries = 0;
-  long rejected_amr_entries = 0;
-  long rejected_invalid_entries = 0;
-  long rejected_mixed_entries = 0;
-  long stepped_entries = 0;
-  long stepper_attempted_events = 0;
-  long stepper_applied_events = 0;
-  long stepper_rejected_events = 0;
-  long stepper_diffusion_only_catchup = 0;
-  long moment_columns_built = 0;
+  const auto stats = pelec::odtles::accumulateRuntimeODTMomentumLESTerm(
+    level, geom, grids, dmap, area_ptr, volume, odt_manager, state_valid,
+    state_same_level, state_host_filled, dt, LESTerm,
+    [&](const amrex::MFIter& mfi,
+        amrex::FabType typ,
+        const amrex::Array<amrex::FArrayBox const*, AMREX_SPACEDIM>& flux_ec) {
+      updateFluxRegistersLES(reflux_factor, LESTerm, dt, mfi, typ, flux_ec);
+    });
 
-  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
-    const amrex::Box& vbx = mfi.validbox();
-    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv))
-    {
-      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
-        pelec::odtles::ODTLineGeometry line_geom(geom, level, iv, dir);
-        const auto support_data = odt_manager.collectSupportData(
-          line_geom, geom, state_valid, state_same_level, state_host_filled);
-
-        const int n_boundary = support_data.count(
-          pelec::odtles::ODTManager::SupportProvenance::PhysicalBoundaryGhost);
-        const int n_amr = support_data.count(
-          pelec::odtles::ODTManager::SupportProvenance::AMRCoarseFineFilled);
-        const int n_invalid = support_data.count(
-          pelec::odtles::ODTManager::SupportProvenance::InvalidUnsupported);
-        const int n_reject_types =
-          (n_boundary > 0 ? 1 : 0) + (n_amr > 0 ? 1 : 0) + (n_invalid > 0 ? 1 : 0);
-
-        // Explicit T4 runtime provenance policy:
-        // allow: SameLevelValidCell, SameLevelFilledGhost
-        // reject: PhysicalBoundaryGhost, AMRCoarseFineFilled, InvalidUnsupported
-        if (n_reject_types > 1) {
-          ++rejected_mixed_entries;
-          continue;
-        }
-        if (n_boundary > 0) {
-          ++rejected_boundary_entries;
-          continue;
-        }
-        if (n_amr > 0) {
-          ++rejected_amr_entries;
-          continue;
-        }
-        if (n_invalid > 0) {
-          ++rejected_invalid_entries;
-          continue;
-        }
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          support_data.allSameLevelAccepted(),
-          "ODTLES support provenance policy mismatch in runtime hook");
-
-        auto* entry = odt_manager.findLineEntry(level, iv, dir);
-        if (entry != nullptr && entry->state.valid()) {
-          odt_manager.reconcileLineStateFromSupportData(
-            level, iv, dir, geom, support_data);
-        } else {
-          odt_manager.initializeLineStateFromSupportData(
-            level, iv, dir, geom, support_data);
-        }
-
-        auto* stepped_entry = odt_manager.findLineEntry(level, iv, dir);
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          stepped_entry != nullptr && stepped_entry->state.valid(),
-          "ODTLES runtime expected a valid persistent line before local stepping");
-
-        pelec::odtles::ODTStepper::Controls step_ctrl{};
-        step_ctrl.max_internal_iterations =
-          odt_manager.params().max_local_substeps > 0
-            ? odt_manager.params().max_local_substeps
-            : 1;
-        step_ctrl.sampler_controls.deterministic = true;
-        step_ctrl.sampler_controls.seed = static_cast<std::uint64_t>(
-          (static_cast<unsigned>(level) + 1U) * 73856093U ^
-          (static_cast<unsigned>(dir) + 1U) * 19349663U ^
-          (static_cast<unsigned>(iv[0]) + 1U) * 83492791U ^
-          (static_cast<unsigned>(iv[1]) + 1U) * 2654435761U ^
-          (static_cast<unsigned>(iv[2]) + 1U) * 97531U);
-
-        const auto step_rep = pelec::odtles::ODTStepper::advanceOneLESTimestep(
-          stepped_entry->geometry, stepped_entry->state, dt, step_ctrl);
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          step_rep.reached_dt_les,
-          "ODTLES local stepper failed to close dt_LES exactly");
-
-        const auto moment_column =
-          pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
-            stepped_entry->geometry, stepped_entry->state);
-        const auto momentum_sgs_intermediate =
-          pelec::odtles::ODTMomentExtractor::buildDirectionalMomentumContribution(
-            moment_column);
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          momentum_sgs_intermediate.valid &&
-            momentum_sgs_intermediate.dir == dir,
-          "ODTLES directional SGS intermediate metadata mismatch");
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          momentum_sgs_intermediate.q[pelec::odtles::ODTMomentExtractor::
-                                         DirectionalMomentumContribution::Ueden] == 0.0,
-          "ODTLES directional SGS intermediate must keep UEDEN inactive");
-
-        auto const& dir_cc = odt_dir_cc[dir].array(mfi);
-        for (int n = 0; n < odt_flux_ncomp; ++n) {
-          dir_cc(iv, n) = momentum_sgs_intermediate.q[static_cast<std::size_t>(n)];
-        }
-        ++moment_columns_built;
-
-        ++stepped_entries;
-        stepper_attempted_events += step_rep.attempted_events;
-        stepper_applied_events += step_rep.applied_events;
-        stepper_rejected_events += step_rep.rejected_events;
-        if (step_rep.closed_by_diffusion_only_catchup) {
-          ++stepper_diffusion_only_catchup;
-        }
-      }
-    }
-  }
-
-  const long rejected_total = rejected_boundary_entries + rejected_amr_entries +
-                              rejected_invalid_entries + rejected_mixed_entries;
+  const long rejected_total = stats.rejected_boundary_entries +
+                              stats.rejected_amr_entries +
+                              stats.rejected_invalid_entries +
+                              stats.rejected_mixed_entries;
   if (verbose != 0 && rejected_total > 0) {
     amrex::Print()
       << "ODTLES: rejected " << rejected_total
       << " owner-direction entries by explicit T4 support-provenance policy. "
-      << "[boundary_ghost=" << rejected_boundary_entries
-      << ", amr_coarse_fine=" << rejected_amr_entries
-      << ", invalid=" << rejected_invalid_entries
-      << ", mixed=" << rejected_mixed_entries << "]" << std::endl;
+      << "[boundary_ghost=" << stats.rejected_boundary_entries
+      << ", amr_coarse_fine=" << stats.rejected_amr_entries
+      << ", invalid=" << stats.rejected_invalid_entries
+      << ", mixed=" << stats.rejected_mixed_entries << "]" << std::endl;
   }
-  if (verbose != 0 && stepped_entries > 0) {
-    amrex::Print() << "ODTLES: stepped " << stepped_entries
+  if (verbose != 0 && stats.stepped_entries > 0) {
+    amrex::Print() << "ODTLES: stepped " << stats.stepped_entries
                    << " local lines over dt_LES with neutral SGS return. "
-                   << "[attempted_events=" << stepper_attempted_events
-                   << ", applied_events=" << stepper_applied_events
-                   << ", rejected_events=" << stepper_rejected_events
-                    << ", diffusion_only_catchup_entries="
-                   << stepper_diffusion_only_catchup
+                   << "[attempted_events=" << stats.stepper_attempted_events
+                   << ", applied_events=" << stats.stepper_applied_events
+                   << ", rejected_events=" << stats.stepper_rejected_events
+                   << ", diffusion_only_catchup_entries="
+                   << stats.stepper_diffusion_only_catchup
                    << ", directional_momentum_columns="
-                   << moment_columns_built << "]" << std::endl;
-  }
-
-  // Fill same-level/periodic ghosts for centered directional intermediates.
-  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
-    odt_dir_cc[dir].FillBoundary(geom.periodicity());
-  }
-
-  // Map centered directional ODT SGS contributions to face fluxes in the
-  // matching face-normal direction and then deposit conservatively.
-  // For fixed direction j and momentum component i:
-  //   centered q_i^(j) = -tau_ij
-  //   face flux F_i^(j) = A_j * avg_face(q_i^(j))
-  // with avg_face as arithmetic average between adjacent centered values.
-  // UEDEN is explicitly kept inactive: F_UEDEN^(j)=0.
-  const auto domain = geom.Domain();
-  auto const& fact =
-    dynamic_cast<amrex::EBFArrayBoxFactory const&>(LESTerm.Factory());
-  auto const& flags = fact.getMultiEBCellFlagFab();
-
-#ifdef AMREX_USE_OMP
-#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
-#endif
-  {
-    for (amrex::MFIter mfi(LESTerm, amrex::TilingIfNotGPU()); mfi.isValid();
-         ++mfi) {
-      const amrex::Box vbox = mfi.tilebox();
-      const amrex::Box cbox = amrex::grow(vbox, 0);
-
-      const auto& flag_fab = flags[mfi];
-      amrex::FabType typ = flag_fab.getType(cbox);
-      if (typ != amrex::FabType::regular) {
-        amrex::Error("LES on a non-regular EB Fab is not available.");
-      }
-      if (typ == amrex::FabType::covered) {
-        continue;
-      }
-
-      const amrex::Array<const amrex::Box, AMREX_SPACEDIM> eboxes = {
-        AMREX_D_DECL(
-          amrex::surroundingNodes(cbox, 0), amrex::surroundingNodes(cbox, 1),
-          amrex::surroundingNodes(cbox, 2))};
-
-      amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> flux_ec;
-      amrex::GpuArray<amrex::Array4<amrex::Real>, AMREX_SPACEDIM> flx;
-      resizeAndSetFlux(eboxes, flx, flux_ec);
-
-      const amrex::GpuArray<
-        const amrex::Array4<const amrex::Real>, AMREX_SPACEDIM>
-        a{{AMREX_D_DECL(
-          area[0].array(mfi), area[1].array(mfi), area[2].array(mfi))}};
-
-      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
-        const auto qcc = odt_dir_cc[dir].const_array(mfi);
-        amrex::ParallelFor(
-          eboxes[dir], [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept {
-            const amrex::IntVect iv(AMREX_D_DECL(i, j, k));
-            const amrex::IntVect ivm =
-              iv - amrex::IntVect::TheDimensionVector(dir);
-            const bool has_hi = domain.contains(iv);
-            const bool has_lo = domain.contains(ivm);
-
-            const int il = i - (dir == 0 ? 1 : 0);
-            const int jl = j - (dir == 1 ? 1 : 0);
-            const int kl = k - (dir == 2 ? 1 : 0);
-
-            const auto centered_face_avg = [&](int comp) -> amrex::Real {
-              const amrex::Real q_hi = has_hi ? qcc(i, j, k, comp) : 0.0;
-              const amrex::Real q_lo = has_lo ? qcc(il, jl, kl, comp) : 0.0;
-              if (has_hi && has_lo) {
-                return 0.5 * (q_hi + q_lo);
-              }
-              if (has_hi) {
-                return q_hi;
-              }
-              if (has_lo) {
-                return q_lo;
-              }
-              return 0.0;
-            };
-
-            const amrex::Real area_j = a[dir](i, j, k);
-            flx[dir](i, j, k, UMX) = area_j * centered_face_avg(
-              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomX);
-            flx[dir](i, j, k, UMY) = area_j * centered_face_avg(
-              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomY);
-            flx[dir](i, j, k, UMZ) = area_j * centered_face_avg(
-              pelec::odtles::ODTMomentExtractor::DirectionalMomentumContribution::MomZ);
-            flx[dir](i, j, k, UEDEN) = 0.0;
-          });
-      }
-
-      computeFluxDiv(LESTerm, mfi, vbox, flx, volume);
-      updateFluxRegistersLES(
-        reflux_factor, LESTerm, dt, mfi, typ,
-        {AMREX_D_DECL(flux_ec.data(), &flux_ec[1], &flux_ec[2])});
-    }
+                   << stats.moment_columns_built << "]" << std::endl;
   }
 }
 
@@ -507,6 +284,238 @@ computeFluxDiv(
       });
   }
 }
+
+namespace pelec::odtles
+{
+
+RuntimeDepositionStats
+accumulateRuntimeODTMomentumLESTerm(
+  int level,
+  const amrex::Geometry& geom,
+  const amrex::BoxArray& grids,
+  const amrex::DistributionMapping& dmap,
+  const amrex::Array<const amrex::MultiFab*, AMREX_SPACEDIM>& area,
+  const amrex::MultiFab& volume,
+  ODTManager& odt_manager,
+  const amrex::MultiFab& state_valid,
+  const amrex::MultiFab& state_same_level,
+  const amrex::MultiFab& state_host_filled,
+  amrex::Real dt,
+  amrex::MultiFab& LESTerm,
+  const FluxRegisterUpdater& reflux_updater)
+{
+  RuntimeDepositionStats stats{};
+  const int old_allow_nested = amrex::MFIter::allowMultipleMFIters(1);
+  odt_manager.initializeLevel(level, grids, dmap);
+
+  constexpr int odt_flux_ncomp =
+    ODTMomentExtractor::DirectionalMomentumContribution::NumComponents;
+  amrex::Array<amrex::MultiFab, AMREX_SPACEDIM> odt_dir_cc;
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    odt_dir_cc[dir].define(grids, dmap, odt_flux_ncomp, 1);
+    odt_dir_cc[dir].setVal(0.0, 0, odt_flux_ncomp, odt_dir_cc[dir].nGrow());
+  }
+
+  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
+    const amrex::Box& vbx = mfi.validbox();
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv))
+    {
+      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+        ODTLineGeometry line_geom(geom, level, iv, dir);
+        const auto support_data = odt_manager.collectSupportData(
+          line_geom, geom, state_valid, state_same_level, state_host_filled);
+
+        const int n_boundary = support_data.count(
+          ODTManager::SupportProvenance::PhysicalBoundaryGhost);
+        const int n_amr = support_data.count(
+          ODTManager::SupportProvenance::AMRCoarseFineFilled);
+        const int n_invalid = support_data.count(
+          ODTManager::SupportProvenance::InvalidUnsupported);
+        const int n_reject_types =
+          (n_boundary > 0 ? 1 : 0) + (n_amr > 0 ? 1 : 0) + (n_invalid > 0 ? 1 : 0);
+
+        if (n_reject_types > 1) {
+          ++stats.rejected_mixed_entries;
+          continue;
+        }
+        if (n_boundary > 0) {
+          ++stats.rejected_boundary_entries;
+          continue;
+        }
+        if (n_amr > 0) {
+          ++stats.rejected_amr_entries;
+          continue;
+        }
+        if (n_invalid > 0) {
+          ++stats.rejected_invalid_entries;
+          continue;
+        }
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          support_data.allSameLevelAccepted(),
+          "ODTLES support provenance policy mismatch in runtime hook");
+
+        auto* entry = odt_manager.findLineEntry(level, iv, dir);
+        if (entry != nullptr && entry->state.valid()) {
+          odt_manager.reconcileLineStateFromSupportData(
+            level, iv, dir, geom, support_data);
+        } else {
+          odt_manager.initializeLineStateFromSupportData(
+            level, iv, dir, geom, support_data);
+        }
+
+        auto* stepped_entry = odt_manager.findLineEntry(level, iv, dir);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          stepped_entry != nullptr && stepped_entry->state.valid(),
+          "ODTLES runtime expected a valid persistent line before local stepping");
+
+        ODTStepper::Controls step_ctrl{};
+        step_ctrl.max_internal_iterations =
+          odt_manager.params().max_local_substeps > 0
+            ? odt_manager.params().max_local_substeps
+            : 1;
+        step_ctrl.sampler_controls.deterministic = true;
+        step_ctrl.sampler_controls.seed = static_cast<std::uint64_t>(
+          (static_cast<unsigned>(level) + 1U) * 73856093U ^
+          (static_cast<unsigned>(dir) + 1U) * 19349663U ^
+          (static_cast<unsigned>(iv[0]) + 1U) * 83492791U ^
+          (static_cast<unsigned>(iv[1]) + 1U) * 2654435761U ^
+          (static_cast<unsigned>(iv[2]) + 1U) * 97531U);
+
+        const auto step_rep = ODTStepper::advanceOneLESTimestep(
+          stepped_entry->geometry, stepped_entry->state, dt, step_ctrl);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          step_rep.reached_dt_les,
+          "ODTLES local stepper failed to close dt_LES exactly");
+
+        const auto moment_column =
+          ODTMomentExtractor::extractDirectionalMomentumColumn(
+            stepped_entry->geometry, stepped_entry->state);
+        const auto momentum_sgs_intermediate =
+          ODTMomentExtractor::buildDirectionalMomentumContribution(moment_column);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          momentum_sgs_intermediate.valid &&
+            momentum_sgs_intermediate.dir == dir,
+          "ODTLES directional SGS intermediate metadata mismatch");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+          momentum_sgs_intermediate.q
+              [ODTMomentExtractor::DirectionalMomentumContribution::Ueden] == 0.0,
+          "ODTLES directional SGS intermediate must keep UEDEN inactive");
+
+        auto const& dir_cc = odt_dir_cc[dir].array(mfi);
+        for (int n = 0; n < odt_flux_ncomp; ++n) {
+          dir_cc(iv, n) = momentum_sgs_intermediate.q[static_cast<std::size_t>(n)];
+        }
+        ++stats.moment_columns_built;
+
+        ++stats.stepped_entries;
+        stats.stepper_attempted_events += step_rep.attempted_events;
+        stats.stepper_applied_events += step_rep.applied_events;
+        stats.stepper_rejected_events += step_rep.rejected_events;
+        if (step_rep.closed_by_diffusion_only_catchup) {
+          ++stats.stepper_diffusion_only_catchup;
+        }
+      }
+    }
+  }
+
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    odt_dir_cc[dir].FillBoundary(geom.periodicity());
+  }
+
+  const auto domain = geom.Domain();
+  const auto* eb_fact =
+    dynamic_cast<amrex::EBFArrayBoxFactory const*>(&LESTerm.Factory());
+  const auto* flags = eb_fact != nullptr ? &eb_fact->getMultiEBCellFlagFab() : nullptr;
+
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+  {
+    for (amrex::MFIter mfi(LESTerm, amrex::TilingIfNotGPU()); mfi.isValid();
+         ++mfi) {
+      const amrex::Box vbox = mfi.tilebox();
+      const amrex::Box cbox = amrex::grow(vbox, 0);
+
+      amrex::FabType typ = amrex::FabType::regular;
+      if (flags != nullptr) {
+        const auto& flag_fab = (*flags)[mfi];
+        typ = flag_fab.getType(cbox);
+        if (typ != amrex::FabType::regular) {
+          amrex::Error("LES on a non-regular EB Fab is not available.");
+        }
+        if (typ == amrex::FabType::covered) {
+          continue;
+        }
+      }
+
+      const amrex::Array<const amrex::Box, AMREX_SPACEDIM> eboxes = {
+        AMREX_D_DECL(
+          amrex::surroundingNodes(cbox, 0), amrex::surroundingNodes(cbox, 1),
+          amrex::surroundingNodes(cbox, 2))};
+
+      amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> flux_ec;
+      amrex::GpuArray<amrex::Array4<amrex::Real>, AMREX_SPACEDIM> flx;
+      resizeAndSetFlux(eboxes, flx, flux_ec);
+
+      const amrex::GpuArray<
+        const amrex::Array4<const amrex::Real>, AMREX_SPACEDIM>
+        a{{AMREX_D_DECL(
+          area[0]->array(mfi), area[1]->array(mfi), area[2]->array(mfi))}};
+
+      for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+        const auto qcc = odt_dir_cc[dir].const_array(mfi);
+        amrex::ParallelFor(
+          eboxes[dir], [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept {
+            const amrex::IntVect iv(AMREX_D_DECL(i, j, k));
+            const amrex::IntVect ivm =
+              iv - amrex::IntVect::TheDimensionVector(dir);
+            const bool has_hi = domain.contains(iv);
+            const bool has_lo = domain.contains(ivm);
+
+            const int il = i - (dir == 0 ? 1 : 0);
+            const int jl = j - (dir == 1 ? 1 : 0);
+            const int kl = k - (dir == 2 ? 1 : 0);
+
+            const auto centered_face_avg = [&](int comp) -> amrex::Real {
+              const amrex::Real q_hi = has_hi ? qcc(i, j, k, comp) : 0.0;
+              const amrex::Real q_lo = has_lo ? qcc(il, jl, kl, comp) : 0.0;
+              if (has_hi && has_lo) {
+                return 0.5 * (q_hi + q_lo);
+              }
+              if (has_hi) {
+                return q_hi;
+              }
+              if (has_lo) {
+                return q_lo;
+              }
+              return 0.0;
+            };
+
+            const amrex::Real area_j = a[dir](i, j, k);
+            flx[dir](i, j, k, UMX) = area_j * centered_face_avg(
+              ODTMomentExtractor::DirectionalMomentumContribution::MomX);
+            flx[dir](i, j, k, UMY) = area_j * centered_face_avg(
+              ODTMomentExtractor::DirectionalMomentumContribution::MomY);
+            flx[dir](i, j, k, UMZ) = area_j * centered_face_avg(
+              ODTMomentExtractor::DirectionalMomentumContribution::MomZ);
+            flx[dir](i, j, k, UEDEN) = 0.0;
+          });
+      }
+
+      computeFluxDiv(LESTerm, mfi, vbox, flx, volume);
+
+      if (reflux_updater) {
+        reflux_updater(
+          mfi, typ, {AMREX_D_DECL(flux_ec.data(), &flux_ec[1], &flux_ec[2])});
+      }
+    }
+  }
+
+  amrex::MFIter::allowMultipleMFIters(old_allow_nested);
+  return stats;
+}
+
+} // namespace pelec::odtles
 
 void
 PeleC::updateFluxRegistersLES(

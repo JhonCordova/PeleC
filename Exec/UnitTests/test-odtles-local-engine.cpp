@@ -1,6 +1,9 @@
 #include "gtest/gtest.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 
 #include <AMReX_Array.H>
 #include <AMReX_Box.H>
@@ -10,11 +13,14 @@
 #include <AMReX_IntVect.H>
 #include <AMReX_MultiFab.H>
 #include <AMReX_ParallelDescriptor.H>
+#include <AMReX_RealBox.H>
+#include <AMReX_Vector.H>
 
 #include "Diffterm.H"
 #include "IndexDefines.H"
 #include "ODTDiffusion.H"
 #include "ODTMomentExtractor.H"
+#include "ODTRuntimeLESBridge.H"
 #include "ODTStepper.H"
 #include "ODTTripletMap.H"
 
@@ -258,6 +264,159 @@ computeSingleLevelLinearDeposition(
 
   buildOdtDirectionalFluxes(cbox, domain, odt_dir_cc, area, flux_ec);
   computeDivFromFluxes(cbox, flux_ec, volume, lterm);
+}
+
+struct RuntimeSignature
+{
+  amrex::Real sum_umx = 0.0;
+  amrex::Real sum_umy = 0.0;
+  amrex::Real sum_umz = 0.0;
+  amrex::Real sum_ueden = 0.0;
+  amrex::Real l1_umx = 0.0;
+  amrex::Real l1_umy = 0.0;
+  amrex::Real l1_umz = 0.0;
+  amrex::Real l1_ueden = 0.0;
+  amrex::Real l1_others = 0.0;
+  long stepped_entries = 0;
+  long moment_columns_built = 0;
+};
+
+RuntimeSignature
+computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(31, 3, 3)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(32.0, 4.0, 4.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+
+  amrex::BoxArray ba(domain);
+  ba.maxSize(4);
+  amrex::DistributionMapping dm(ba);
+
+  constexpr int support_ng =
+    (pelec::odtles::ODTLineGeometry::MVPNumSupportCells - 1) / 2;
+  amrex::MultiFab state_valid(ba, dm, NVAR, 0);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
+  state_valid.setVal(0.0);
+  state_same_level.setVal(0.0);
+  state_host_filled.setVal(0.0);
+
+  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
+    const auto vbx = mfi.validbox();
+    const auto s = state_valid.array(mfi);
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv)) {
+      const amrex::Real x = static_cast<amrex::Real>(iv[0]);
+      const amrex::Real y = static_cast<amrex::Real>(iv[1]);
+      const amrex::Real z = static_cast<amrex::Real>(iv[2]);
+      s(iv, URHO) = 1.0 + 0.01 * x;
+      s(iv, UMX) = 0.15 * x + 0.02 * y + 0.5;
+      s(iv, UMY) = -0.10 * x + 0.03 * z + 0.25;
+      s(iv, UMZ) = 0.30 * x - 0.02 * y + 0.01 * z - 0.75;
+      s(iv, UEDEN) = 2.5 + 0.02 * x + 0.01 * y;
+    }
+  }
+  amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
+  state_same_level.FillBoundary(geom.periodicity());
+  amrex::MultiFab::Copy(
+    state_host_filled, state_same_level, 0, 0, NVAR, state_same_level.nGrow());
+
+  amrex::Array<amrex::MultiFab, AMREX_SPACEDIM> area{
+    AMREX_D_DECL(
+      amrex::MultiFab(amrex::convert(ba, amrex::IntVect::TheDimensionVector(0)), dm, 1, 0),
+      amrex::MultiFab(amrex::convert(ba, amrex::IntVect::TheDimensionVector(1)), dm, 1, 0),
+      amrex::MultiFab(amrex::convert(ba, amrex::IntVect::TheDimensionVector(2)), dm, 1, 0))};
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    area[dir].setVal(1.0);
+  }
+  amrex::MultiFab volume(ba, dm, 1, 0);
+  volume.setVal(1.0);
+
+  lterm_out.define(ba, dm, NVAR, 0);
+  lterm_out.setVal(0.0);
+
+  pelec::odtles::ODTManager odt_manager;
+  pelec::odtles::ODTParams params{};
+  params.enabled = true;
+  params.max_local_substeps = 1;
+  odt_manager.setParams(params);
+
+  const amrex::Array<const amrex::MultiFab*, AMREX_SPACEDIM> area_ptr = {
+    AMREX_D_DECL(&area[0], &area[1], &area[2])};
+  const auto stats = pelec::odtles::accumulateRuntimeODTMomentumLESTerm(
+    0, geom, ba, dm, area_ptr, volume, odt_manager, state_valid, state_same_level,
+    state_host_filled, 1.0e-2, lterm_out);
+
+  RuntimeSignature sig{};
+  for (amrex::MFIter mfi(lterm_out, false); mfi.isValid(); ++mfi) {
+    const auto vbx = mfi.validbox();
+    const auto arr = lterm_out.const_array(mfi);
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv)) {
+      const amrex::Real umx = arr(iv, UMX);
+      const amrex::Real umy = arr(iv, UMY);
+      const amrex::Real umz = arr(iv, UMZ);
+      const amrex::Real ueden = arr(iv, UEDEN);
+      sig.sum_umx += umx;
+      sig.sum_umy += umy;
+      sig.sum_umz += umz;
+      sig.sum_ueden += ueden;
+      sig.l1_umx += std::abs(umx);
+      sig.l1_umy += std::abs(umy);
+      sig.l1_umz += std::abs(umz);
+      sig.l1_ueden += std::abs(ueden);
+      sig.l1_others += std::abs(arr(iv, URHO));
+      for (int n = UFS; n < UFS + NUM_SPECIES; ++n) {
+        sig.l1_others += std::abs(arr(iv, n));
+      }
+#if NUM_AUX > 0
+      for (int n = UFX; n < UFX + NUM_AUX; ++n) {
+        sig.l1_others += std::abs(arr(iv, n));
+      }
+#endif
+#if NUM_ADV > 0
+      for (int n = UFA; n < UFA + NUM_ADV; ++n) {
+        sig.l1_others += std::abs(arr(iv, n));
+      }
+#endif
+    }
+  }
+  amrex::ParallelDescriptor::ReduceRealSum(sig.sum_umx);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.sum_umy);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.sum_umz);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.sum_ueden);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.l1_umx);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.l1_umy);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.l1_umz);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.l1_ueden);
+  amrex::ParallelDescriptor::ReduceRealSum(sig.l1_others);
+  sig.stepped_entries = stats.stepped_entries;
+  sig.moment_columns_built = stats.moment_columns_built;
+  return sig;
+}
+
+void
+writeRuntimeSignatureIfRequested(const RuntimeSignature& sig)
+{
+  const char* out_path = std::getenv("ODTLES_MPI_SIGNATURE_FILE");
+  if (out_path == nullptr || !amrex::ParallelDescriptor::IOProcessor()) {
+    return;
+  }
+  std::ofstream out(out_path);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    out.good(), "Unable to open ODTLES_MPI_SIGNATURE_FILE for writing");
+  out << std::setprecision(17) << std::scientific;
+  out << "sum_umx " << sig.sum_umx << "\n";
+  out << "sum_umy " << sig.sum_umy << "\n";
+  out << "sum_umz " << sig.sum_umz << "\n";
+  out << "sum_ueden " << sig.sum_ueden << "\n";
+  out << "l1_umx " << sig.l1_umx << "\n";
+  out << "l1_umy " << sig.l1_umy << "\n";
+  out << "l1_umz " << sig.l1_umz << "\n";
+  out << "l1_ueden " << sig.l1_ueden << "\n";
+  out << "l1_others " << sig.l1_others << "\n";
 }
 
 amrex::Real
@@ -514,6 +673,37 @@ TEST(ODTLESLocalEngine, ConservativeMomentumDepositionPartitionConsistency)
     EXPECT_NEAR(valueAt(lterm_single, iv, UMZ), valueAt(lterm_split, iv, UMZ), tol);
     EXPECT_NEAR(valueAt(lterm_single, iv, UEDEN), valueAt(lterm_split, iv, UEDEN), tol);
   }
+}
+
+TEST(ODTLESLocalEngine, RuntimeODTMomentumDepositionMPIBudget)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  amrex::MultiFab lterm_runtime;
+  const RuntimeSignature sig = computeRuntimeODTLESTermSignature(lterm_runtime);
+
+  // Ensure the real runtime path was exercised.
+  EXPECT_GT(sig.stepped_entries, 0);
+  EXPECT_GT(sig.moment_columns_built, 0);
+
+  // Explicit variable targeting.
+  EXPECT_LE(std::abs(sig.sum_ueden), tol);
+  EXPECT_LE(sig.l1_ueden, tol);
+  EXPECT_LE(sig.l1_others, tol);
+}
+
+TEST(ODTLESLocalEngine, RuntimeODTMomentumDepositionMPIParitySignature)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  amrex::MultiFab lterm_runtime;
+  const RuntimeSignature sig = computeRuntimeODTLESTermSignature(lterm_runtime);
+
+  // In-test guardrails; cross-run parity is done by CTest wrapper.
+  EXPECT_GT(sig.stepped_entries, 0);
+  EXPECT_GT(sig.moment_columns_built, 0);
+  EXPECT_LE(sig.l1_ueden, tol);
+  EXPECT_LE(sig.l1_others, tol);
+
+  writeRuntimeSignatureIfRequested(sig);
 }
 
 TEST(ODTLESLocalEngine, ConservativeMomentumDepositionMultiRankStyleBudget)

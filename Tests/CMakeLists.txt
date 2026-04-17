@@ -198,7 +198,7 @@ function(add_test_u TEST_NAME)
     # MPI-specific ODT momentum SGS deposition consistency checks.
     # These are only registered when MPI is enabled/configured.
     if(PELE_ENABLE_MPI)
-      set(ODT_MPI_FILTER "ODTLESLocalEngine.ConservativeMomentumDepositionMultiRankStyleBudget:ODTLESLocalEngine.ConservativeMomentumDepositionAMRCoarseFineInterface")
+      set(ODT_MPI_FILTER "ODTLESLocalEngine.RuntimeODTMomentumDepositionMPIBudget:ODTLESLocalEngine.RuntimeODTMomentumDepositionMPIParitySignature")
 
       # Single-rank MPI launcher path (baseline under mpiexec).
       set(PELE_NP_MPI_1 1)
@@ -220,6 +220,18 @@ function(add_test_u TEST_NAME)
         bash -c "${MPI_COMMANDS_2} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS} --gtest_filter=${ODT_MPI_FILTER}")
       set_tests_properties(
         ${TEST_NAME}-mpi2-odt
+        PROPERTIES TIMEOUT 1800 PROCESSORS ${PELE_NP_MPI_2}
+                   WORKING_DIRECTORY "${CURRENT_TEST_BINARY_DIR}/"
+                   LABELS "unit;mpi;odtles")
+
+      # Explicit 1-rank vs 2-rank runtime ODT LES parity comparison.
+      # This runs the same runtime-path test with np=1 and np=2 and compares
+      # global signatures with an absolute tolerance.
+      add_test(
+        ${TEST_NAME}-mpi12-odt-parity
+        bash -c "set -euo pipefail && rm -f odt_sig_np1.txt odt_sig_np2.txt && ODTLES_MPI_SIGNATURE_FILE=odt_sig_np1.txt ${MPI_COMMANDS_1} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS} --gtest_filter=ODTLESLocalEngine.RuntimeODTMomentumDepositionMPIParitySignature && ODTLES_MPI_SIGNATURE_FILE=odt_sig_np2.txt ${MPI_COMMANDS_2} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS} --gtest_filter=ODTLESLocalEngine.RuntimeODTMomentumDepositionMPIParitySignature && python3 - <<'PY'\nfrom math import isclose\n\ndef read_sig(path):\n    out = {}\n    with open(path, 'r', encoding='utf-8') as f:\n        for line in f:\n            k, v = line.split()\n            out[k] = float(v)\n    return out\n\ns1 = read_sig('odt_sig_np1.txt')\ns2 = read_sig('odt_sig_np2.txt')\nkeys = sorted(set(s1) | set(s2))\nmissing = [k for k in keys if k not in s1 or k not in s2]\nif missing:\n    raise SystemExit(f'Missing signature keys: {missing}')\n\ntol = 1.0e-12\nbad = []\nfor k in keys:\n    if not isclose(s1[k], s2[k], rel_tol=0.0, abs_tol=tol):\n        bad.append((k, s1[k], s2[k]))\nif bad:\n    lines = ['Signature mismatch (abs tol=1e-12):']\n    for k, v1, v2 in bad:\n        lines.append(f'  {k}: np1={v1:.17e} np2={v2:.17e}')\n    raise SystemExit(' | '.join(lines))\nprint('ODT runtime MPI parity OK (abs tol=1e-12)')\nPY")
+      set_tests_properties(
+        ${TEST_NAME}-mpi12-odt-parity
         PROPERTIES TIMEOUT 1800 PROCESSORS ${PELE_NP_MPI_2}
                    WORKING_DIRECTORY "${CURRENT_TEST_BINARY_DIR}/"
                    LABELS "unit;mpi;odtles")
