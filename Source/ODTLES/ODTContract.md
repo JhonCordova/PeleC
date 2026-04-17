@@ -1,40 +1,75 @@
 # ODTLES Embedded SGS Contract (PeleC)
 
 ## Purpose
-This document defines the repository-local engineering contract for embedded ODT SGS development in PeleC.
+This document is the T1 software-and-coupling contract for embedded ODT SGS in
+PeleC. It defines what is active now, what is deferred by phase, and what is
+explicitly excluded.
 
-## Host-solver ownership
-- PeleC is the host LES solver.
-- PeleC owns timestep control, CFL control, AMR sequencing, conservative updates, source-term assembly, and resolved-flow evolution.
-- ODT is subordinate to the LES timestep and participates only as an embedded SGS closure path.
+## Host-solver ownership (non-negotiable)
+- PeleC is the only host LES solver.
+- PeleC owns global timestep control (`dt_LES`), CFL control, AMR sequencing,
+  conservative update assembly, and resolved-flow evolution.
+- ODT is a subordinate local SGS module invoked only from the existing PeleC
+  LES source path.
+- ODT does not own a global advance loop and does not maintain a second
+  resolved-field state.
 
-## Architecture boundary
-- Standalone `ODTLES/ODT` is algorithmic reference only.
-- The target architecture is native PeleC integration, not a second standalone solver architecture.
-- Conservative compatibility with PeleC flux/source plumbing is required.
+## Software-contract touchpoints in PeleC
+The embedded ODT contract is anchored to these host files and locations:
+- `Source/Sources.cpp`: source selection/dispatch path using `les_src`.
+- `Source/LES.cpp`: `getLESTerm()` dispatch and ODT LES-term assembly path
+  (`getODTLESTerm()`).
+- `Source/LES.H`: LES model interfaces and flux/source helpers used by LES-term
+  assembly.
+- `Source/PeleC.H`: LES model enum, LES APIs, and ODT manager sidecar
+  ownership (`odt_manager`).
+- `Source/ODTLES`: ODT local module implementation
+  (manager/geometry/state/reconcile/stepper/moment extraction).
 
-## Current local ownership identity
-- Persistent local ODT entry identity is:
-  - `(level, owner_cell, dir)`
-- One owner cell may have up to three directional entries per level.
+## ODT state ownership and identity
+- ODT persistent state is sidecar-owned by `ODTManager` and is outside the main
+  conserved `MultiFab`.
+- Persistent identity is `(level, owner_cell, dir)`.
+- One owner cell can own up to three directional local lines per level.
 
-## Current responsibility split
-- `ODTLineGeometry`: local 1D support geometry metadata and owner-cell interval metadata.
-- `ODTLineState`: conservative 1D line state storage (`rho`, `rhou`, `rhov`, `rhow`, `rhoE`) plus derived helper accessors.
-- `ODTManager`: persistent ownership/lifecycle and lookup/create APIs for `(level, owner_cell, dir)` entries.
+## LES -> ODT -> LES contract (active path)
+1. LES -> ODT line reconciliation:
+   same-level accepted support data are used to initialize/reconcile each local
+   directional line for the owner cell.
+2. ODT local advancement:
+   each line advances only within host-provided `dt_LES`; local subcycling is
+   subordinate and closes `dt_LES` exactly.
+3. ODT -> LES SGS return:
+   ODT returns directional SGS momentum contributions derived from moments over
+   the owner-cell central interval, not corrected LES fields.
+4. Host conservative assembly:
+   PeleC maps the directional returns to LES fluxes and applies the existing
+   flux-divergence route in the standard LES source assembly path.
 
-## MVP execution priority
-1. Persistent local infrastructure (identity, geometry, conservative line state, manager lifecycle).
-2. LES -> ODT reconciliation.
-3. ODT stepping/subordinate local advancement.
-4. SGS moment/flux extraction and host-side conservative coupling.
+## Owner-cell central interval and Favre moments
+- SGS moments are extracted over the owner-cell central interval of each local
+  directional line.
+- Favre-consistent moments are used to define
+  `tau_ij = <rho u_i u_j> - <rho u_i><rho u_j>/<rho>`.
+- Directional momentum SGS return uses `tau_ij` and is mapped through the
+  existing PeleC LES flux/divergence machinery.
 
-## Explicitly out of current T1-T3 scope
-- LES -> ODT reconciliation logic.
-- ODT stepping/event logic.
-- SGS extraction/closure return logic.
-- Restart/regrid migration of persistent entries.
-- Any standalone-style global domain/solver/driver architecture.
+## Phase scope freeze (MVP and extensions)
+- Phase-1 (active): momentum SGS only via `tau_ij`.
+- Phase-1 (active): `UEDEN` contribution is explicitly kept zero.
+- Phase-2 (deferred): add total-energy SGS work contribution.
+- Phase-3 (deferred): add SGS heat flux `Q_j`.
+- `J_j` and `D_j` are explicitly deferred (not in Phase-1/2/3 MVP closure
+  package).
 
-## Contributor rule
-All ODTLES production changes must remain in `ODTLES/PeleC` and preserve PeleC host ownership and conservative integration semantics.
+## Explicit exclusions for this contract
+- No patch-based McDermott/XLES-style coupling in this package.
+- No direct overwrite/correction of resolved LES fields from ODT.
+- No second global solver/driver architecture ported from standalone ODT.
+- No data-layout migration that embeds ODT state inside the main conserved
+  `MultiFab`.
+
+## T1 closure statement
+For T1 documentation closure, this repository defines ODT as an embedded,
+host-owned, conservative SGS path through existing PeleC LES source plumbing,
+with Phase-1 restricted to momentum SGS and `UEDEN = 0`.
