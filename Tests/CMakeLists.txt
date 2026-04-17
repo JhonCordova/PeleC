@@ -194,6 +194,36 @@ function(add_test_u TEST_NAME)
     endif()
     add_test(${TEST_NAME} bash -c "${MPI_COMMANDS} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS}")
     set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 1800 PROCESSORS ${PELE_NP} WORKING_DIRECTORY "${CURRENT_TEST_BINARY_DIR}/" LABELS "unit")
+
+    # MPI-specific ODT momentum SGS deposition consistency checks.
+    # These are only registered when MPI is enabled/configured.
+    if(PELE_ENABLE_MPI)
+      set(ODT_MPI_FILTER "ODTLESLocalEngine.ConservativeMomentumDepositionMultiRankStyleBudget:ODTLESLocalEngine.ConservativeMomentumDepositionAMRCoarseFineInterface")
+
+      # Single-rank MPI launcher path (baseline under mpiexec).
+      set(PELE_NP_MPI_1 1)
+      set(MPI_COMMANDS_1 "${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${PELE_NP_MPI_1} ${MPIEXEC_PREFLAGS}")
+      add_test(
+        ${TEST_NAME}-mpi1-odt
+        bash -c "${MPI_COMMANDS_1} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS} --gtest_filter=${ODT_MPI_FILTER}")
+      set_tests_properties(
+        ${TEST_NAME}-mpi1-odt
+        PROPERTIES TIMEOUT 1800 PROCESSORS ${PELE_NP_MPI_1}
+                   WORKING_DIRECTORY "${CURRENT_TEST_BINARY_DIR}/"
+                   LABELS "unit;mpi;odtles")
+
+      # True multi-rank execution path.
+      set(PELE_NP_MPI_2 2)
+      set(MPI_COMMANDS_2 "${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${PELE_NP_MPI_2} ${MPIEXEC_PREFLAGS}")
+      add_test(
+        ${TEST_NAME}-mpi2-odt
+        bash -c "${MPI_COMMANDS_2} ${CURRENT_TEST_EXE} ${MPIEXEC_POSTFLAGS} --gtest_filter=${ODT_MPI_FILTER}")
+      set_tests_properties(
+        ${TEST_NAME}-mpi2-odt
+        PROPERTIES TIMEOUT 1800 PROCESSORS ${PELE_NP_MPI_2}
+                   WORKING_DIRECTORY "${CURRENT_TEST_BINARY_DIR}/"
+                   LABELS "unit;mpi;odtles")
+    endif()
 endfunction(add_test_u)
 
 function(add_test_spray TEST_EXE_DIR)

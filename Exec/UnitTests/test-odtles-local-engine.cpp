@@ -9,6 +9,7 @@
 #include <AMReX_FArrayBox.H>
 #include <AMReX_IntVect.H>
 #include <AMReX_MultiFab.H>
+#include <AMReX_ParallelDescriptor.H>
 
 #include "Diffterm.H"
 #include "IndexDefines.H"
@@ -210,6 +211,69 @@ valueAt(const amrex::MultiFab& mf, const amrex::IntVect& iv, int n)
     }
   }
   return 0.0;
+}
+
+void
+fillLinearDirectionalContribution(
+  amrex::FArrayBox& qfab,
+  const amrex::Box& bx,
+  amrex::Real dx)
+{
+  auto const q = qfab.array();
+  for (amrex::IntVect iv = bx.smallEnd(); iv <= bx.bigEnd(); bx.next(iv)) {
+    const amrex::Real x = (static_cast<amrex::Real>(iv[0]) + 0.5) * dx;
+    q(iv, 0) = x;
+    q(iv, 1) = -x;
+    q(iv, 2) = 2.0 * x;
+    q(iv, 3) = 0.0;
+  }
+}
+
+void
+computeSingleLevelLinearDeposition(
+  const amrex::Box& cbox,
+  const amrex::Box& domain,
+  amrex::Real dx,
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM>& odt_dir_cc,
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM>& flux_ec,
+  amrex::FArrayBox& lterm)
+{
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> area{
+    AMREX_D_DECL(
+      amrex::FArrayBox(amrex::surroundingNodes(cbox, 0), 1),
+      amrex::FArrayBox(amrex::surroundingNodes(cbox, 1), 1),
+      amrex::FArrayBox(amrex::surroundingNodes(cbox, 2), 1))};
+  amrex::FArrayBox volume(cbox, 1);
+
+  for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+    area[dir].setVal(1.0);
+    flux_ec[dir].setVal(0.0);
+    odt_dir_cc[dir].setVal(0.0);
+  }
+
+  // Build only j=0 contribution profile; j=1,2 stay zero.
+  fillLinearDirectionalContribution(odt_dir_cc[0], odt_dir_cc[0].box(), dx);
+  volume.setVal(dx);
+  lterm.setVal(0.0);
+
+  buildOdtDirectionalFluxes(cbox, domain, odt_dir_cc, area, flux_ec);
+  computeDivFromFluxes(cbox, flux_ec, volume, lterm);
+}
+
+amrex::Real
+sumWeightedComponent(
+  const amrex::FArrayBox& lterm,
+  const amrex::FArrayBox& volume,
+  const amrex::Box& bx,
+  int comp)
+{
+  const auto d = lterm.const_array();
+  const auto vol = volume.const_array();
+  amrex::Real sum = 0.0;
+  for (amrex::IntVect iv = bx.smallEnd(); iv <= bx.bigEnd(); bx.next(iv)) {
+    sum += vol(iv, 0) * d(iv, comp);
+  }
+  return sum;
 }
 
 } // namespace
@@ -449,6 +513,190 @@ TEST(ODTLESLocalEngine, ConservativeMomentumDepositionPartitionConsistency)
     EXPECT_NEAR(valueAt(lterm_single, iv, UMY), valueAt(lterm_split, iv, UMY), tol);
     EXPECT_NEAR(valueAt(lterm_single, iv, UMZ), valueAt(lterm_split, iv, UMZ), tol);
     EXPECT_NEAR(valueAt(lterm_single, iv, UEDEN), valueAt(lterm_split, iv, UEDEN), tol);
+  }
+}
+
+TEST(ODTLESLocalEngine, ConservativeMomentumDepositionMultiRankStyleBudget)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(63, 0, 0)));
+
+  amrex::BoxArray ba(domain);
+  ba.maxSize(4);
+  amrex::DistributionMapping dm(ba);
+  amrex::MultiFab lterm;
+  computeLtermFromCenteredContributionMF(ba, dm, domain, lterm);
+
+  amrex::Real sum_umx = 0.0;
+  amrex::Real sum_umy = 0.0;
+  amrex::Real sum_umz = 0.0;
+  amrex::Real sum_ueden = 0.0;
+  for (amrex::MFIter mfi(lterm, false); mfi.isValid(); ++mfi) {
+    const auto vbx = mfi.validbox();
+    const auto arr = lterm.const_array(mfi);
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv)) {
+      sum_umx += arr(iv, UMX);
+      sum_umy += arr(iv, UMY);
+      sum_umz += arr(iv, UMZ);
+      sum_ueden += arr(iv, UEDEN);
+      EXPECT_LE(std::abs(arr(iv, URHO)), tol);
+      for (int n = UFS; n < UFS + NUM_SPECIES; ++n) {
+        EXPECT_LE(std::abs(arr(iv, n)), tol);
+      }
+#if NUM_AUX > 0
+      for (int n = UFX; n < UFX + NUM_AUX; ++n) {
+        EXPECT_LE(std::abs(arr(iv, n)), tol);
+      }
+#endif
+#if NUM_ADV > 0
+      for (int n = UFA; n < UFA + NUM_ADV; ++n) {
+        EXPECT_LE(std::abs(arr(iv, n)), tol);
+      }
+#endif
+    }
+  }
+  amrex::ParallelDescriptor::ReduceRealSum(sum_umx);
+  amrex::ParallelDescriptor::ReduceRealSum(sum_umy);
+  amrex::ParallelDescriptor::ReduceRealSum(sum_umz);
+  amrex::ParallelDescriptor::ReduceRealSum(sum_ueden);
+
+  // For qx=[x,-x,2x,0] and one-sided physical boundaries used in T6 mapping:
+  // sum(D) = -(F_right - F_left) = [-(63-0), +(63-0), -2*(63-0)].
+  EXPECT_NEAR(sum_umx, -63.0, tol);
+  EXPECT_NEAR(sum_umy, 63.0, tol);
+  EXPECT_NEAR(sum_umz, -126.0, tol);
+  EXPECT_NEAR(sum_ueden, 0.0, tol);
+}
+
+TEST(ODTLESLocalEngine, ConservativeMomentumDepositionAMRCoarseFineInterface)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+
+  // Coarse level: 8 cells over [0,8], dx=1.0.
+  const amrex::Box coarse_domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(7, 0, 0)));
+  // Fine level (r=2) logical full domain [0,16), but only right-half patch active.
+  const amrex::Box fine_domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(15, 0, 0)));
+  const amrex::Box fine_patch(
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(15, 0, 0)));
+
+  // Coarse buffers.
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> coarse_q{
+    AMREX_D_DECL(
+      amrex::FArrayBox(amrex::grow(coarse_domain, 1), 4),
+      amrex::FArrayBox(amrex::grow(coarse_domain, 1), 4),
+      amrex::FArrayBox(amrex::grow(coarse_domain, 1), 4))};
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> coarse_flux{
+    AMREX_D_DECL(
+      amrex::FArrayBox(amrex::surroundingNodes(coarse_domain, 0), NVAR),
+      amrex::FArrayBox(amrex::surroundingNodes(coarse_domain, 1), NVAR),
+      amrex::FArrayBox(amrex::surroundingNodes(coarse_domain, 2), NVAR))};
+  amrex::FArrayBox coarse_lterm(coarse_domain, NVAR);
+  amrex::FArrayBox coarse_vol(coarse_domain, 1);
+  coarse_vol.setVal(1.0);
+
+  computeSingleLevelLinearDeposition(
+    coarse_domain, coarse_domain, 1.0, coarse_q, coarse_flux, coarse_lterm);
+
+  // Fine patch buffers (with 1-cell ghost so interface face can use central avg).
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> fine_q{
+    AMREX_D_DECL(
+      amrex::FArrayBox(amrex::grow(fine_patch, 1), 4),
+      amrex::FArrayBox(amrex::grow(fine_patch, 1), 4),
+      amrex::FArrayBox(amrex::grow(fine_patch, 1), 4))};
+  amrex::Array<amrex::FArrayBox, AMREX_SPACEDIM> fine_flux{
+    AMREX_D_DECL(
+      amrex::FArrayBox(amrex::surroundingNodes(fine_patch, 0), NVAR),
+      amrex::FArrayBox(amrex::surroundingNodes(fine_patch, 1), NVAR),
+      amrex::FArrayBox(amrex::surroundingNodes(fine_patch, 2), NVAR))};
+  amrex::FArrayBox fine_lterm(fine_patch, NVAR);
+  amrex::FArrayBox fine_vol(fine_patch, 1);
+  fine_vol.setVal(0.5);
+
+  computeSingleLevelLinearDeposition(
+    fine_patch, fine_domain, 0.5, fine_q, fine_flux, fine_lterm);
+
+  // Coarse-fine interface flux continuity at x=4:
+  // coarse face i=4 equals fine face i=8 (same physical face).
+  const auto cfx = coarse_flux[0].const_array();
+  const auto ffx = fine_flux[0].const_array();
+  EXPECT_NEAR(cfx(4, 0, 0, UMX), ffx(8, 0, 0, UMX), tol);
+  EXPECT_NEAR(cfx(4, 0, 0, UMY), ffx(8, 0, 0, UMY), tol);
+  EXPECT_NEAR(cfx(4, 0, 0, UMZ), ffx(8, 0, 0, UMZ), tol);
+  EXPECT_NEAR(cfx(4, 0, 0, UEDEN), 0.0, tol);
+  EXPECT_NEAR(ffx(8, 0, 0, UEDEN), 0.0, tol);
+
+  // Composite AMR active-state budget:
+  // active coarse cells [0..3] + active fine cells [8..15].
+  // Internal coarse-fine interface contributions cancel when interface fluxes match.
+  const amrex::Box coarse_active(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(3, 0, 0)));
+  const amrex::Real sum_umx =
+    sumWeightedComponent(coarse_lterm, coarse_vol, coarse_active, UMX) +
+    sumWeightedComponent(fine_lterm, fine_vol, fine_patch, UMX);
+  const amrex::Real sum_umy =
+    sumWeightedComponent(coarse_lterm, coarse_vol, coarse_active, UMY) +
+    sumWeightedComponent(fine_lterm, fine_vol, fine_patch, UMY);
+  const amrex::Real sum_umz =
+    sumWeightedComponent(coarse_lterm, coarse_vol, coarse_active, UMZ) +
+    sumWeightedComponent(fine_lterm, fine_vol, fine_patch, UMZ);
+
+  // Composite external boundaries: left coarse face i=0 and right fine face i=16.
+  const amrex::Real rhs_umx =
+    -(ffx(16, 0, 0, UMX) - cfx(0, 0, 0, UMX));
+  const amrex::Real rhs_umy =
+    -(ffx(16, 0, 0, UMY) - cfx(0, 0, 0, UMY));
+  const amrex::Real rhs_umz =
+    -(ffx(16, 0, 0, UMZ) - cfx(0, 0, 0, UMZ));
+  EXPECT_NEAR(sum_umx, rhs_umx, tol);
+  EXPECT_NEAR(sum_umy, rhs_umy, tol);
+  EXPECT_NEAR(sum_umz, rhs_umz, tol);
+
+  // Momentum-only targeting across both active regions.
+  const auto cd = coarse_lterm.const_array();
+  for (amrex::IntVect iv = coarse_active.smallEnd(); iv <= coarse_active.bigEnd();
+       coarse_active.next(iv)) {
+    EXPECT_LE(std::abs(cd(iv, UEDEN)), tol);
+    EXPECT_LE(std::abs(cd(iv, URHO)), tol);
+    for (int n = UFS; n < UFS + NUM_SPECIES; ++n) {
+      EXPECT_LE(std::abs(cd(iv, n)), tol);
+    }
+#if NUM_AUX > 0
+    for (int n = UFX; n < UFX + NUM_AUX; ++n) {
+      EXPECT_LE(std::abs(cd(iv, n)), tol);
+    }
+#endif
+#if NUM_ADV > 0
+    for (int n = UFA; n < UFA + NUM_ADV; ++n) {
+      EXPECT_LE(std::abs(cd(iv, n)), tol);
+    }
+#endif
+  }
+  const auto fd = fine_lterm.const_array();
+  for (amrex::IntVect iv = fine_patch.smallEnd(); iv <= fine_patch.bigEnd();
+       fine_patch.next(iv)) {
+    EXPECT_LE(std::abs(fd(iv, UEDEN)), tol);
+    EXPECT_LE(std::abs(fd(iv, URHO)), tol);
+    for (int n = UFS; n < UFS + NUM_SPECIES; ++n) {
+      EXPECT_LE(std::abs(fd(iv, n)), tol);
+    }
+#if NUM_AUX > 0
+    for (int n = UFX; n < UFX + NUM_AUX; ++n) {
+      EXPECT_LE(std::abs(fd(iv, n)), tol);
+    }
+#endif
+#if NUM_ADV > 0
+    for (int n = UFA; n < UFA + NUM_ADV; ++n) {
+      EXPECT_LE(std::abs(fd(iv, n)), tol);
+    }
+#endif
   }
 }
 
