@@ -203,7 +203,7 @@ PeleC::getODTLESTerm(
   if (verbose != 0 && rejected_total > 0) {
     amrex::Print()
       << "ODTLES: rejected " << rejected_total
-      << " owner-direction entries by explicit T4 support-provenance policy. "
+      << " owner-direction entries by explicit LES-to-ODT support-provenance policy. "
       << "[boundary_ghost=" << stats.rejected_boundary_entries
       << ", amr_coarse_fine=" << stats.rejected_amr_entries
       << ", invalid=" << stats.rejected_invalid_entries
@@ -288,6 +288,73 @@ computeFluxDiv(
 namespace pelec::odtles
 {
 
+ODTLinePreparationResult
+prepareRuntimeODTLineFromLESSupport(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  ODTManager& odt_manager,
+  const amrex::MultiFab& state_valid,
+  const amrex::MultiFab& state_same_level,
+  const amrex::MultiFab& state_host_filled,
+  RuntimeDepositionStats& stats)
+{
+  ODTLinePreparationResult out{};
+
+  ODTLineGeometry line_geom(geom, level, owner_cell, dir);
+  const auto support_data = odt_manager.collectSupportData(
+    line_geom, geom, state_valid, state_same_level, state_host_filled);
+
+  const int n_boundary = support_data.count(
+    ODTManager::SupportProvenance::PhysicalBoundaryGhost);
+  const int n_amr =
+    support_data.count(ODTManager::SupportProvenance::AMRCoarseFineFilled);
+  const int n_invalid =
+    support_data.count(ODTManager::SupportProvenance::InvalidUnsupported);
+  const int n_reject_types =
+    (n_boundary > 0 ? 1 : 0) + (n_amr > 0 ? 1 : 0) + (n_invalid > 0 ? 1 : 0);
+
+  if (n_reject_types > 1) {
+    ++stats.rejected_mixed_entries;
+    return out;
+  }
+  if (n_boundary > 0) {
+    ++stats.rejected_boundary_entries;
+    return out;
+  }
+  if (n_amr > 0) {
+    ++stats.rejected_amr_entries;
+    return out;
+  }
+  if (n_invalid > 0) {
+    ++stats.rejected_invalid_entries;
+    return out;
+  }
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    support_data.allSameLevelAccepted(),
+    "ODTLES support provenance policy mismatch in runtime hook");
+
+  auto* entry = odt_manager.findLineEntry(level, owner_cell, dir);
+  if (entry != nullptr && entry->state.valid()) {
+    odt_manager.reconcileLineStateFromSupportData(
+      level, owner_cell, dir, geom, support_data);
+    out.reconciled = true;
+  } else {
+    odt_manager.initializeLineStateFromSupportData(
+      level, owner_cell, dir, geom, support_data);
+    out.initialized = true;
+  }
+
+  auto* prepared_entry = odt_manager.findLineEntry(level, owner_cell, dir);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    prepared_entry != nullptr && prepared_entry->state.valid(),
+    "ODTLES runtime expected a valid persistent line before local stepping");
+  out.accepted = true;
+  out.line_entry = prepared_entry;
+  return out;
+}
+
 RuntimeDepositionStats
 accumulateRuntimeODTMomentumLESTerm(
   int level,
@@ -321,52 +388,13 @@ accumulateRuntimeODTMomentumLESTerm(
     for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv))
     {
       for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
-        ODTLineGeometry line_geom(geom, level, iv, dir);
-        const auto support_data = odt_manager.collectSupportData(
-          line_geom, geom, state_valid, state_same_level, state_host_filled);
-
-        const int n_boundary = support_data.count(
-          ODTManager::SupportProvenance::PhysicalBoundaryGhost);
-        const int n_amr = support_data.count(
-          ODTManager::SupportProvenance::AMRCoarseFineFilled);
-        const int n_invalid = support_data.count(
-          ODTManager::SupportProvenance::InvalidUnsupported);
-        const int n_reject_types =
-          (n_boundary > 0 ? 1 : 0) + (n_amr > 0 ? 1 : 0) + (n_invalid > 0 ? 1 : 0);
-
-        if (n_reject_types > 1) {
-          ++stats.rejected_mixed_entries;
+        const auto prep = prepareRuntimeODTLineFromLESSupport(
+          level, iv, dir, geom, odt_manager, state_valid, state_same_level,
+          state_host_filled, stats);
+        if (!prep.accepted) {
           continue;
         }
-        if (n_boundary > 0) {
-          ++stats.rejected_boundary_entries;
-          continue;
-        }
-        if (n_amr > 0) {
-          ++stats.rejected_amr_entries;
-          continue;
-        }
-        if (n_invalid > 0) {
-          ++stats.rejected_invalid_entries;
-          continue;
-        }
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          support_data.allSameLevelAccepted(),
-          "ODTLES support provenance policy mismatch in runtime hook");
-
-        auto* entry = odt_manager.findLineEntry(level, iv, dir);
-        if (entry != nullptr && entry->state.valid()) {
-          odt_manager.reconcileLineStateFromSupportData(
-            level, iv, dir, geom, support_data);
-        } else {
-          odt_manager.initializeLineStateFromSupportData(
-            level, iv, dir, geom, support_data);
-        }
-
-        auto* stepped_entry = odt_manager.findLineEntry(level, iv, dir);
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-          stepped_entry != nullptr && stepped_entry->state.valid(),
-          "ODTLES runtime expected a valid persistent line before local stepping");
+        auto* stepped_entry = prep.line_entry;
 
         ODTStepper::Controls step_ctrl{};
         step_ctrl.max_internal_iterations =

@@ -8,6 +8,7 @@
 #include <AMReX_DistributionMapping.H>
 #include <AMReX_FArrayBox.H>
 #include <AMReX_Geometry.H>
+#include <AMReX_IntVect.H>
 #include <AMReX_MFIter.H>
 #include <AMReX_MultiFab.H>
 
@@ -29,6 +30,32 @@ struct RuntimeDepositionStats
   long stepper_diffusion_only_catchup = 0;
   long moment_columns_built = 0;
 };
+
+struct ODTLinePreparationResult
+{
+  bool accepted = false;
+  bool initialized = false;
+  bool reconciled = false;
+  ODTManager::LineEntry* line_entry = nullptr;
+};
+
+// Runtime LES-to-ODT line-preparation gate:
+// - collect support provenance
+// - reject unsupported/mixed provenance
+// - initialize or reconcile the persistent line state
+//
+// This helper intentionally excludes local stepping and SGS extraction/deposition.
+ODTLinePreparationResult
+prepareRuntimeODTLineFromLESSupport(
+  int level,
+  const amrex::IntVect& owner_cell,
+  int dir,
+  const amrex::Geometry& geom,
+  ODTManager& odt_manager,
+  const amrex::MultiFab& state_valid,
+  const amrex::MultiFab& state_same_level,
+  const amrex::MultiFab& state_host_filled,
+  RuntimeDepositionStats& stats);
 
 using FluxRegisterUpdater = std::function<void(
   const amrex::MFIter&,
