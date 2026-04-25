@@ -62,6 +62,28 @@ The embedded ODT contract is anchored to these host files and locations:
 - `J_j` and `D_j` are explicitly deferred (not in Phase-1/2/3 MVP closure
   package).
 
+## Runtime ODT-Line Molecular Model (production standard)
+- Runtime ODT line momentum diffusion is unambiguous in production:
+  - thermochemical admissibility/EOS recovery is always active for transport
+    queries,
+  - host molecular viscosity is always used,
+  - momentum diffusion form is
+    `d(rho*u_i)/dt = d/ds(mu * d(u_i)/ds)`, `u_i=(rho*u_i)/rho`.
+- User-facing toggles for enabling/disabling or selecting alternate molecular
+  momentum forms are deprecated and ignored in production runtime.
+- The only runtime ODT local-step control retained is:
+  - `pelec.odt_max_local_substeps`
+- Thermochemical recovery remains a local admissibility/EOS bridge only;
+  persistent ODT line storage remains conservative (`rho`, momentum, `rhoE`,
+  `rhoY_k`) with no persistent temperature variable.
+
+Minimal input example:
+```ini
+pelec.do_les = 1
+pelec.les_model = 4
+pelec.odt_max_local_substeps = 1
+```
+
 ## Explicit exclusions for this contract
 - No patch-based McDermott/XLES-style coupling in this package.
 - No direct overwrite/correction of resolved LES fields from ODT.

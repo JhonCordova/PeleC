@@ -215,6 +215,15 @@ CI                           Real          0.0
 # Constant Smagorinsky PrT coefficient
 PrT                          Real          1.0
 
+# ODTLES local runtime: maximum number of internal ODT substeps over one
+# host-owned dt_LES.
+odt_max_local_substeps       int           1
+
+# Runtime ODT line molecular momentum diffusion now always uses:
+# - thermochemical recovery + host molecular viscosity
+# - velocity-gradient viscous-flux form
+# Legacy runtime toggles are deprecated and ignored.
+
 #-----------------------------------------------------------------------------
 # category: EB
 #-----------------------------------------------------------------------------

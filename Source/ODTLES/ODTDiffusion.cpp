@@ -10,6 +10,10 @@
 #include <AMReX_IntVect.H>
 #include <AMReX_RealBox.H>
 
+#include "ODTThermoBridge.H"
+#include "PeleC.H"
+#include "PelePhysics.H"
+
 namespace pelec::odtles
 {
 
@@ -99,7 +103,61 @@ maxAbsStateChange(const ODTLineState& a, const ODTLineState& b)
   return max_abs;
 }
 
+bool
+isMomentumComponent(int comp)
+{
+  return (
+    comp == static_cast<int>(ODTDiffusion::Component::RhoU) ||
+    comp == static_cast<int>(ODTDiffusion::Component::RhoV) ||
+    comp == static_cast<int>(ODTDiffusion::Component::RhoW));
+}
+
+amrex::Real
+computeDynamicViscosity(
+  const ODTThermoBridge::RecoveredState& rec)
+{
+  const bool get_xi = false;
+  const bool get_mu = true;
+  const bool get_lam = false;
+  const bool get_Ddiag = false;
+  const bool get_chi = false;
+  amrex::Real mu = 0.0;
+  amrex::Real xi_dummy = 0.0;
+  amrex::Real lam_dummy = 0.0;
+  std::vector<amrex::Real> Y = rec.Y;
+  auto trans = pele::physics::PhysicsType::transport();
+  auto const* tparm = &PeleC::trans_parms.host_parm();
+  trans.transport(
+    get_xi, get_mu, get_lam, get_Ddiag, get_chi, rec.temperature, rec.rho, Y.data(),
+    nullptr, nullptr, mu, xi_dummy, lam_dummy, tparm);
+  return mu;
+}
+
 } // namespace
+
+ODTDiffusion::MomentumViscosityProfile
+ODTDiffusion::buildMomentumViscosityProfile(const ODTLineState& line_state)
+{
+  MomentumViscosityProfile profile{};
+  profile.dynamic_viscosity_mu.assign(
+    static_cast<std::size_t>(line_state.numCells()), 0.0);
+
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    const auto rec = ODTThermoBridge::recoverCellThermoState(line_state, i);
+    if (!rec.success) {
+      profile.success = false;
+      profile.failure_cell = i;
+      return profile;
+    }
+    const amrex::Real mu = computeDynamicViscosity(rec);
+    const amrex::Real mu_nonneg = std::max<amrex::Real>(mu, 0.0);
+    profile.dynamic_viscosity_mu[static_cast<std::size_t>(i)] = mu_nonneg;
+  }
+
+  profile.success = true;
+  profile.failure_cell = -1;
+  return profile;
+}
 
 void
 ODTDiffusion::applyImplicitUniform(
@@ -134,36 +192,116 @@ ODTDiffusion::applyImplicitUniform(
   std::vector<amrex::Real> c(static_cast<std::size_t>(n), 0.0);
   std::vector<amrex::Real> rhs(static_cast<std::size_t>(n), 0.0);
   std::vector<amrex::Real> q_new(static_cast<std::size_t>(n), 0.0);
+  std::vector<amrex::Real> coeff_face(static_cast<std::size_t>(n - 1), 0.0);
+
+  MomentumViscosityProfile mu_profile{};
+  bool built_mu_profile = false;
 
   for (int comp = 0; comp < NComp; ++comp) {
     if (!controls.diffuse_component[static_cast<std::size_t>(comp)]) {
       continue;
     }
 
-    const amrex::Real nu = controls.diffusivity[static_cast<std::size_t>(comp)];
-    if (nu <= 0.0) {
-      continue;
+    if (
+      controls.use_molecular_viscosity_for_momentum &&
+      isMomentumComponent(comp)) {
+      if (!built_mu_profile) {
+        mu_profile = buildMomentumViscosityProfile(line_state);
+        if (
+          !mu_profile.success &&
+          controls.fail_on_molecular_viscosity_recovery_failure) {
+          AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            false,
+            "ODTDiffusion molecular-viscosity bridge failed thermochemical "
+            "recovery on line cell");
+        }
+        built_mu_profile = true;
+      }
+      if (mu_profile.success) {
+        const amrex::Real mu_floor =
+          std::max<amrex::Real>(controls.molecular_viscosity_floor, 0.0);
+        for (int f = 0; f < n - 1; ++f) {
+          const amrex::Real mu_l = std::max<amrex::Real>(
+            mu_profile.dynamic_viscosity_mu[static_cast<std::size_t>(f)], mu_floor);
+          const amrex::Real mu_r = std::max<amrex::Real>(
+            mu_profile.dynamic_viscosity_mu[static_cast<std::size_t>(f + 1)],
+            mu_floor);
+          const amrex::Real mu_face = std::max<amrex::Real>(0.0, 0.5 * (mu_l + mu_r));
+          if (
+            controls.momentum_molecular_form ==
+            MomentumMolecularForm::ConservativeVariableNuOnRhoU) {
+            const amrex::Real rho_l = line_state.cell(f).rho;
+            const amrex::Real rho_r = line_state.cell(f + 1).rho;
+            const amrex::Real nu_l = mu_l / rho_l;
+            const amrex::Real nu_r = mu_r / rho_r;
+            coeff_face[static_cast<std::size_t>(f)] =
+              std::max<amrex::Real>(0.0, 0.5 * (nu_l + nu_r));
+          } else {
+            coeff_face[static_cast<std::size_t>(f)] = mu_face;
+          }
+        }
+      } else {
+        const amrex::Real coeff_const =
+          controls.diffusivity[static_cast<std::size_t>(comp)];
+        if (coeff_const <= 0.0) {
+          continue;
+        }
+        for (int f = 0; f < n - 1; ++f) {
+          coeff_face[static_cast<std::size_t>(f)] = coeff_const;
+        }
+      }
+    } else {
+      const amrex::Real coeff_const =
+        controls.diffusivity[static_cast<std::size_t>(comp)];
+      if (coeff_const <= 0.0) {
+        continue;
+      }
+      for (int f = 0; f < n - 1; ++f) {
+        coeff_face[static_cast<std::size_t>(f)] = coeff_const;
+      }
     }
 
-    const amrex::Real r = dt * nu * inv_dx2;
     for (int i = 0; i < n; ++i) {
       q_old[static_cast<std::size_t>(i)] = getComponent(line_state.cell(i), comp);
       rhs[static_cast<std::size_t>(i)] = q_old[static_cast<std::size_t>(i)];
+    }
 
-      // Zero-gradient (Neumann) closure at line ends:
-      // ghost values mirror boundary-adjacent interior values.
-      if (i == 0) {
-        a[0] = 0.0;
-        b[0] = 1.0 + r;
-        c[0] = -r;
-      } else if (i == n - 1) {
-        a[static_cast<std::size_t>(i)] = -r;
-        b[static_cast<std::size_t>(i)] = 1.0 + r;
-        c[static_cast<std::size_t>(i)] = 0.0;
-      } else {
-        a[static_cast<std::size_t>(i)] = -r;
-        b[static_cast<std::size_t>(i)] = 1.0 + 2.0 * r;
-        c[static_cast<std::size_t>(i)] = -r;
+    if (
+      controls.use_molecular_viscosity_for_momentum && isMomentumComponent(comp) &&
+      mu_profile.success &&
+      controls.momentum_molecular_form ==
+        MomentumMolecularForm::VelocityGradientMuFlux) {
+      // Semi-implicit linearization of:
+      //   d(rho*u)/dt = d/ds(mu * d(u)/ds), with u = (rho*u)/rho.
+      // Here rho and mu are frozen from current line state.
+      for (int i = 0; i < n; ++i) {
+        const amrex::Real rho_i = line_state.cell(i).rho;
+        const amrex::Real mu_l =
+          (i > 0) ? coeff_face[static_cast<std::size_t>(i - 1)] : 0.0;
+        const amrex::Real mu_r =
+          (i < n - 1) ? coeff_face[static_cast<std::size_t>(i)] : 0.0;
+        const amrex::Real k = dt * inv_dx2;
+
+        a[static_cast<std::size_t>(i)] =
+          (i > 0) ? -k * (mu_l / line_state.cell(i - 1).rho) : 0.0;
+        b[static_cast<std::size_t>(i)] = 1.0 + k * ((mu_l + mu_r) / rho_i);
+        c[static_cast<std::size_t>(i)] =
+          (i < n - 1) ? -k * (mu_r / line_state.cell(i + 1).rho) : 0.0;
+      }
+    } else {
+      for (int i = 0; i < n; ++i) {
+        const amrex::Real coeff_l =
+          (i > 0) ? coeff_face[static_cast<std::size_t>(i - 1)] : 0.0;
+        const amrex::Real coeff_r =
+          (i < n - 1) ? coeff_face[static_cast<std::size_t>(i)] : 0.0;
+        const amrex::Real r_l = dt * coeff_l * inv_dx2;
+        const amrex::Real r_r = dt * coeff_r * inv_dx2;
+
+        // No-flux (Neumann) closure at line ends through zero boundary-face
+        // coefficient and interior face diffusion only.
+        a[static_cast<std::size_t>(i)] = -r_l;
+        b[static_cast<std::size_t>(i)] = 1.0 + r_l + r_r;
+        c[static_cast<std::size_t>(i)] = -r_r;
       }
     }
 
@@ -196,6 +334,7 @@ ODTDiffusion::runMVPValidationHook()
   Controls ctrl{};
   ctrl.diffuse_component.fill(false);
   ctrl.diffuse_component[static_cast<int>(Component::RhoU)] = true;
+  ctrl.use_molecular_viscosity_for_momentum = false;
   ctrl.diffusivity.fill(0.0);
   ctrl.diffusivity[static_cast<int>(Component::RhoU)] = 0.1;
 

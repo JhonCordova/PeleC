@@ -21,6 +21,7 @@ target_sources(${pele_exe_name}
   ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTParams.cpp
   ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTReconcile.cpp
   ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTStepper.cpp
+  ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTThermoBridge.cpp
   ${CMAKE_SOURCE_DIR}/Source/ODTLES/ODTTripletMap.cpp
   )
 

@@ -90,24 +90,75 @@ computeLimitedSlope(
 void
 setCellFromComponentArray(
   ODTLineState::ConservativeCell& cell,
-  const std::array<amrex::Real, 5>& v)
+  const std::vector<amrex::Real>& v)
 {
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    static_cast<int>(v.size()) == 5 + NUM_SPECIES,
+    "ODTReconcile conservative component size mismatch");
   cell.rho = v[0];
   cell.rhou = v[1];
   cell.rhov = v[2];
   cell.rhow = v[3];
   cell.rhoE = v[4];
+  if (cell.rhoY.size() != static_cast<std::size_t>(NUM_SPECIES)) {
+    cell.rhoY.resize(static_cast<std::size_t>(NUM_SPECIES), 0.0);
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    cell.rhoY[static_cast<std::size_t>(n)] = v[5 + n];
+  }
 }
 
-std::array<amrex::Real, 5>
+std::vector<amrex::Real>
 componentArrayFromCell(const ODTLineState::ConservativeCell& c)
 {
-  return {c.rho, c.rhou, c.rhov, c.rhow, c.rhoE};
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    c.rhoY.size() == static_cast<std::size_t>(NUM_SPECIES),
+    "ODTReconcile expected rhoY container to match NUM_SPECIES");
+  std::vector<amrex::Real> q(static_cast<std::size_t>(5 + NUM_SPECIES), 0.0);
+  q[0] = c.rho;
+  q[1] = c.rhou;
+  q[2] = c.rhov;
+  q[3] = c.rhow;
+  q[4] = c.rhoE;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    q[static_cast<std::size_t>(5 + n)] = c.rhoY[static_cast<std::size_t>(n)];
+  }
+  return q;
 }
 
 amrex::Real
-specificInternalEnergy(const std::array<amrex::Real, 5>& q)
+componentValue(const ODTLineState::ConservativeCell& c, int n)
 {
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    n >= 0 && n < 5 + NUM_SPECIES,
+    "ODTReconcile conservative component index out of range");
+  if (n == 0) {
+    return c.rho;
+  }
+  if (n == 1) {
+    return c.rhou;
+  }
+  if (n == 2) {
+    return c.rhov;
+  }
+  if (n == 3) {
+    return c.rhow;
+  }
+  if (n == 4) {
+    return c.rhoE;
+  }
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    c.rhoY.size() == static_cast<std::size_t>(NUM_SPECIES),
+    "ODTReconcile expected rhoY container to match NUM_SPECIES");
+  return c.rhoY[static_cast<std::size_t>(n - 5)];
+}
+
+amrex::Real
+specificInternalEnergy(const std::vector<amrex::Real>& q)
+{
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    static_cast<int>(q.size()) == 5 + NUM_SPECIES,
+    "ODTReconcile conservative component size mismatch");
   const amrex::Real rho = q[0];
   if (rho <= 0.0) {
     return -1.0;
@@ -121,11 +172,16 @@ specificInternalEnergy(const std::array<amrex::Real, 5>& q)
 
 bool
 isAdmissible(
-  const std::array<amrex::Real, 5>& q,
+  const std::vector<amrex::Real>& q,
   const ODTReconcile::ReconcileControls& ctrl)
 {
   if (q[0] <= ctrl.rho_floor) {
     return false;
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    if (q[static_cast<std::size_t>(5 + n)] < 0.0) {
+      return false;
+    }
   }
   const amrex::Real eint = specificInternalEnergy(q);
   return eint > ctrl.e_floor;
@@ -176,40 +232,25 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
   const amrex::Real dx = geom.deltaS();
   const auto owner_avg =
     local_support_cell_averages[static_cast<std::size_t>(owner)];
-  std::array<amrex::Real, 5> q0{
-    owner_avg.rho, owner_avg.rhou, owner_avg.rhov, owner_avg.rhow, owner_avg.rhoE};
+  constexpr int hydro_components = 5;
+  const int ncomp = 5 + NUM_SPECIES;
+  auto q0 = componentArrayFromCell(owner_avg);
 
-  std::array<amrex::Real, 5> ql = q0;
-  std::array<amrex::Real, 5> qr = q0;
+  std::vector<amrex::Real> ql = q0;
+  std::vector<amrex::Real> qr = q0;
   if (neg_idx >= 0) {
-    const auto l = local_support_cell_averages[static_cast<std::size_t>(neg_idx)];
-    ql = {l.rho, l.rhou, l.rhov, l.rhow, l.rhoE};
+    ql = componentArrayFromCell(
+      local_support_cell_averages[static_cast<std::size_t>(neg_idx)]);
   }
   if (pos_idx >= 0) {
-    const auto r = local_support_cell_averages[static_cast<std::size_t>(pos_idx)];
-    qr = {r.rho, r.rhou, r.rhov, r.rhow, r.rhoE};
+    qr = componentArrayFromCell(
+      local_support_cell_averages[static_cast<std::size_t>(pos_idx)]);
   }
 
-  std::array<amrex::Real, 5> slopes{};
+  std::vector<amrex::Real> slopes(static_cast<std::size_t>(ncomp), 0.0);
   const auto neg_side = collectIndicesByOffsetSign(geom, -1);
   const auto pos_side = collectIndicesByOffsetSign(geom, 1);
-  for (int n = 0; n < 5; ++n) {
-    auto compVal = [&](const ConservativeCell& c) -> amrex::Real {
-      if (n == 0) {
-        return c.rho;
-      }
-      if (n == 1) {
-        return c.rhou;
-      }
-      if (n == 2) {
-        return c.rhov;
-      }
-      if (n == 3) {
-        return c.rhow;
-      }
-      return c.rhoE;
-    };
-
+  for (int n = 0; n < ncomp; ++n) {
     if (neg_idx >= 0 && pos_idx >= 0) {
       slopes[n] = computeLimitedSlope(ql[n], q0[n], qr[n], dx);
     } else {
@@ -230,8 +271,8 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
         if (s == 0.0) {
           continue;
         }
-        const amrex::Real qi =
-          compVal(local_support_cell_averages[static_cast<std::size_t>(i)]);
+        const amrex::Real qi = componentValue(
+          local_support_cell_averages[static_cast<std::size_t>(i)], n);
         const amrex::Real dqi = qi - q0[n];
         if (std::abs(dqi) > tol) {
           has_nonuniform = true;
@@ -257,34 +298,32 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
 
   // Local overshoot control: clamp each reconstructed support average to the
   // envelope over the full local support stencil.
-  std::array<amrex::Real, 5> qmin{};
-  std::array<amrex::Real, 5> qmax{};
-  for (int n = 0; n < 5; ++n) {
+  std::vector<amrex::Real> qmin(static_cast<std::size_t>(ncomp), 0.0);
+  std::vector<amrex::Real> qmax(static_cast<std::size_t>(ncomp), 0.0);
+  for (int n = 0; n < ncomp; ++n) {
     qmin[n] = q0[n];
     qmax[n] = q0[n];
   }
   for (const auto& c : local_support_cell_averages) {
-    qmin[0] = std::min(qmin[0], c.rho);
-    qmin[1] = std::min(qmin[1], c.rhou);
-    qmin[2] = std::min(qmin[2], c.rhov);
-    qmin[3] = std::min(qmin[3], c.rhow);
-    qmin[4] = std::min(qmin[4], c.rhoE);
-
-    qmax[0] = std::max(qmax[0], c.rho);
-    qmax[1] = std::max(qmax[1], c.rhou);
-    qmax[2] = std::max(qmax[2], c.rhov);
-    qmax[3] = std::max(qmax[3], c.rhow);
-    qmax[4] = std::max(qmax[4], c.rhoE);
+    for (int n = 0; n < ncomp; ++n) {
+      const amrex::Real qi = componentValue(c, n);
+      qmin[n] = std::min(qmin[n], qi);
+      qmax[n] = std::max(qmax[n], qi);
+    }
   }
 
   const auto& segs = geom.supportCells();
   for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
     const amrex::Real s_center = segs[static_cast<std::size_t>(i)].s_center;
 
-    std::array<amrex::Real, 5> qrec{};
-    for (int n = 0; n < 5; ++n) {
+    std::vector<amrex::Real> qrec(static_cast<std::size_t>(ncomp), 0.0);
+    for (int n = 0; n < ncomp; ++n) {
       qrec[n] = q0[n] + slopes[n] * s_center;
       qrec[n] = std::clamp(qrec[n], qmin[n], qmax[n]);
+      if (n >= hydro_components) {
+        // Keep conservative species non-negative on the embedded line.
+        qrec[n] = std::max<amrex::Real>(qrec[n], 0.0);
+      }
     }
 
     ODTLineState::ConservativeCell cell{};
@@ -336,6 +375,8 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     owner < line_state.numCells(),
     "ODTReconcile reconcile owner index out of range");
 
+  constexpr int hydro_components = 5;
+  const int ncomp = hydro_components + NUM_SPECIES;
   const auto q_target = componentArrayFromCell(owner_cell_average);
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
     isAdmissible(q_target, ctrl),
@@ -344,21 +385,21 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
   const auto q_owner_old = componentArrayFromCell(line_state.cell(owner));
 
   // Residual relative to old owner mean at each support cell.
-  std::vector<std::array<amrex::Real, 5>> residuals(
+  std::vector<std::vector<amrex::Real>> residuals(
     static_cast<std::size_t>(line_state.numCells()));
   for (int i = 0; i < line_state.numCells(); ++i) {
     const auto qi = componentArrayFromCell(line_state.cell(i));
     auto& ri = residuals[static_cast<std::size_t>(i)];
-    for (int n = 0; n < 5; ++n) {
+    ri.assign(static_cast<std::size_t>(ncomp), 0.0);
+    for (int n = 0; n < ncomp; ++n) {
       ri[n] = qi[n] - q_owner_old[n];
     }
   }
 
-  auto make_trial =
-    [&](int i, amrex::Real alpha) -> std::array<amrex::Real, 5> {
-    std::array<amrex::Real, 5> q{};
+  auto make_trial = [&](int i, amrex::Real alpha) -> std::vector<amrex::Real> {
+    std::vector<amrex::Real> q(static_cast<std::size_t>(ncomp), 0.0);
     const auto& r = residuals[static_cast<std::size_t>(i)];
-    for (int n = 0; n < 5; ++n) {
+    for (int n = 0; n < ncomp; ++n) {
       q[n] = q_target[n] + alpha * r[n];
     }
     return q;

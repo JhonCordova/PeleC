@@ -217,6 +217,12 @@ ODTManager::findCellAverageInMF(
     out_cell.rhov = arr(iv, UMY);
     out_cell.rhow = arr(iv, UMZ);
     out_cell.rhoE = arr(iv, UEDEN);
+    if (out_cell.rhoY.size() != static_cast<std::size_t>(NUM_SPECIES)) {
+      out_cell.rhoY.resize(static_cast<std::size_t>(NUM_SPECIES), 0.0);
+    }
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      out_cell.rhoY[static_cast<std::size_t>(n)] = arr(iv, UFS + n);
+    }
     return true;
   }
   return false;

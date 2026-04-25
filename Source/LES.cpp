@@ -164,6 +164,13 @@ PeleC::getODTLESTerm(
   amrex::MultiFab& LESTerm,
   amrex::Real reflux_factor)
 {
+  // Keep host ownership of runtime controls while passing explicit
+  // ODT-local controls through ODTManager sidecar parameters.
+  pelec::odtles::ODTParams odt_runtime_params = odt_manager.params();
+  odt_runtime_params.enabled = true;
+  odt_runtime_params.max_local_substeps = odt_max_local_substeps;
+  odt_manager.setParams(odt_runtime_params);
+
   // ODT runtime hookup:
   // 1) prepare/reconcile local lines,
   // 2) advance each line over host-owned dt_LES,
@@ -288,6 +295,24 @@ computeFluxDiv(
 namespace pelec::odtles
 {
 
+void
+configureRuntimeODTStepperControls(
+  const ODTParams& odt_params, ODTStepper::Controls& step_ctrl)
+{
+  step_ctrl.max_internal_iterations =
+    odt_params.max_local_substeps > 0 ? odt_params.max_local_substeps : 1;
+
+  // Production runtime path is now unambiguous:
+  // always recover thermochemical state and use host molecular viscosity in
+  // velocity-gradient viscous-flux form for momentum diffusion.
+  step_ctrl.diffusion_controls.use_molecular_viscosity_for_momentum = true;
+  step_ctrl.diffusion_controls.momentum_molecular_form =
+    ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux;
+  step_ctrl.diffusion_controls.molecular_viscosity_floor = 0.0;
+  step_ctrl.diffusion_controls.fail_on_molecular_viscosity_recovery_failure =
+    true;
+}
+
 ODTLinePreparationResult
 prepareRuntimeODTLineFromLESSupport(
   int level,
@@ -397,10 +422,7 @@ accumulateRuntimeODTMomentumLESTerm(
         auto* stepped_entry = prep.line_entry;
 
         ODTStepper::Controls step_ctrl{};
-        step_ctrl.max_internal_iterations =
-          odt_manager.params().max_local_substeps > 0
-            ? odt_manager.params().max_local_substeps
-            : 1;
+        configureRuntimeODTStepperControls(odt_manager.params(), step_ctrl);
         step_ctrl.sampler_controls.deterministic = true;
         step_ctrl.sampler_controls.seed = static_cast<std::uint64_t>(
           (static_cast<unsigned>(level) + 1U) * 73856093U ^

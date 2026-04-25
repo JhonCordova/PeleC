@@ -1,11 +1,13 @@
 #ifndef PELEC_ODTLES_ODTLINESTATE_H
 #define PELEC_ODTLES_ODTLINESTATE_H
 
+#include <array>
 #include <vector>
 
 #include <AMReX_REAL.H>
 
 #include "ODTLineGeometry.H"
+#include "mechanism.H"
 
 namespace pelec::odtles
 {
@@ -20,6 +22,9 @@ public:
     amrex::Real rhov = 0.0;
     amrex::Real rhow = 0.0;
     amrex::Real rhoE = 0.0;
+    std::vector<amrex::Real> rhoY;
+
+    ConservativeCell() : rhoY(static_cast<std::size_t>(NUM_SPECIES), 0.0) {}
   };
 
   struct ThermoInput
@@ -50,6 +55,13 @@ public:
   amrex::Real velocityU(int i) const;
   amrex::Real velocityV(int i) const;
   amrex::Real velocityW(int i) const;
+  std::array<amrex::Real, AMREX_SPACEDIM> velocities(int i) const;
+
+  // Species helpers derived on demand from conservative state.
+  amrex::Real speciesMassFraction(int i, int n) const;
+  std::vector<amrex::Real> speciesMassFractions(int i) const;
+  bool hasExpectedSpeciesContainerSize(int i) const;
+  bool isCellAdmissible(int i) const;
 
   // Internal-energy helpers derived on demand from conservative state.
   amrex::Real rhoInternalEnergy(int i) const;

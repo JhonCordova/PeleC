@@ -1,5 +1,6 @@
 #include "gtest/gtest.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <array>
@@ -24,7 +25,10 @@
 #include "ODTReconcile.H"
 #include "ODTRuntimeLESBridge.H"
 #include "ODTStepper.H"
+#include "ODTThermoBridge.H"
 #include "ODTTripletMap.H"
+#include "PeleC.H"
+#include "PelePhysics.H"
 
 namespace pelec_tests
 {
@@ -43,6 +47,18 @@ makeCell(amrex::Real rho, amrex::Real rhou, amrex::Real rhov, amrex::Real rhow, 
   c.rhow = rhow;
   c.rhoE = rhoE;
   return c;
+}
+
+void
+setSpeciesSequence(ConservativeCell& c, amrex::Real scale, amrex::Real shift = 0.0)
+{
+  if (c.rhoY.size() != static_cast<std::size_t>(NUM_SPECIES)) {
+    c.rhoY.resize(static_cast<std::size_t>(NUM_SPECIES), 0.0);
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] =
+      shift + scale * static_cast<amrex::Real>(n + 1);
+  }
 }
 
 std::array<amrex::Real, 5>
@@ -77,6 +93,9 @@ setConservativeAt(
     arr(iv, UMY) = c.rhov;
     arr(iv, UMZ) = c.rhow;
     arr(iv, UEDEN) = c.rhoE;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      arr(iv, UFS + n) = c.rhoY[static_cast<std::size_t>(n)];
+    }
     return;
   }
 }
@@ -91,6 +110,60 @@ specificInternalEnergy(const ConservativeCell& c)
   const amrex::Real kinetic =
     0.5 * inv_rho * (c.rhou * c.rhou + c.rhov * c.rhov + c.rhow * c.rhow);
   return (c.rhoE - kinetic) * inv_rho;
+}
+
+amrex::Real
+hostDynamicViscosityFromRecoveredState(
+  const pelec::odtles::ODTThermoBridge::RecoveredState& rec)
+{
+  const bool get_xi = false;
+  const bool get_mu = true;
+  const bool get_lam = false;
+  const bool get_Ddiag = false;
+  const bool get_chi = false;
+  amrex::Real mu = 0.0;
+  amrex::Real xi_dummy = 0.0;
+  amrex::Real lam_dummy = 0.0;
+  std::vector<amrex::Real> Y = rec.Y;
+  auto trans = pele::physics::PhysicsType::transport();
+  auto const* tparm = &PeleC::trans_parms.host_parm();
+  trans.transport(
+    get_xi, get_mu, get_lam, get_Ddiag, get_chi, rec.temperature, rec.rho,
+    Y.data(), nullptr, nullptr, mu, xi_dummy, lam_dummy, tparm);
+  return mu;
+}
+
+amrex::Real
+maxAbsMomentumComponentChange(
+  const pelec::odtles::ODTLineState& before,
+  const pelec::odtles::ODTLineState& after,
+  int comp)
+{
+  AMREX_ALWAYS_ASSERT(before.numCells() == after.numCells());
+  amrex::Real max_abs = 0.0;
+  for (int i = 0; i < before.numCells(); ++i) {
+    amrex::Real q_before = 0.0;
+    amrex::Real q_after = 0.0;
+    if (comp == static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU)) {
+      q_before = before.cell(i).rhou;
+      q_after = after.cell(i).rhou;
+    } else if (
+      comp == static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoV)) {
+      q_before = before.cell(i).rhov;
+      q_after = after.cell(i).rhov;
+    } else if (
+      comp == static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoW)) {
+      q_before = before.cell(i).rhow;
+      q_after = after.cell(i).rhow;
+    } else {
+      AMREX_ALWAYS_ASSERT_WITH_MESSAGE(false, "Momentum component expected");
+    }
+    const amrex::Real d = std::abs(q_after - q_before);
+    if (d > max_abs) {
+      max_abs = d;
+    }
+  }
+  return max_abs;
 }
 
 void
@@ -346,7 +419,8 @@ struct RuntimeSignature
 };
 
 RuntimeSignature
-computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
+computeRuntimeODTLESTermSignature(
+  amrex::MultiFab& lterm_out, const pelec::odtles::ODTParams& runtime_params_in)
 {
   const amrex::Box domain(
     amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
@@ -365,9 +439,18 @@ computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
   amrex::MultiFab state_valid(ba, dm, NVAR, 0);
   amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
   amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
-  state_valid.setVal(0.0);
-  state_same_level.setVal(0.0);
-  state_host_filled.setVal(0.0);
+  auto initializeBackgroundConservativeState = [](amrex::MultiFab& mf) {
+    mf.setVal(0.0);
+    mf.setVal(1.0, URHO, 1, mf.nGrow());
+    mf.setVal(3.0, UEDEN, 1, mf.nGrow());
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      mf.setVal(
+        1.0 / static_cast<amrex::Real>(NUM_SPECIES), UFS + n, 1, mf.nGrow());
+    }
+  };
+  initializeBackgroundConservativeState(state_valid);
+  initializeBackgroundConservativeState(state_same_level);
+  initializeBackgroundConservativeState(state_host_filled);
 
   for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
     const auto vbx = mfi.validbox();
@@ -380,7 +463,13 @@ computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
       s(iv, UMX) = 0.15 * x + 0.02 * y + 0.5;
       s(iv, UMY) = -0.10 * x + 0.03 * z + 0.25;
       s(iv, UMZ) = 0.30 * x - 0.02 * y + 0.01 * z - 0.75;
-      s(iv, UEDEN) = 2.5 + 0.02 * x + 0.01 * y;
+      // Keep manufactured conservative state thermodynamically admissible
+      // now that runtime molecular momentum diffusion always recovers (rho,T,Y).
+      s(iv, UEDEN) = 80.0 + 0.20 * x + 0.10 * y;
+      for (int n = 0; n < NUM_SPECIES; ++n) {
+        s(iv, UFS + n) =
+          (1.0 + 0.01 * x) * (0.01 * static_cast<amrex::Real>(n + 1));
+      }
     }
   }
   amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
@@ -403,9 +492,11 @@ computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
   lterm_out.setVal(0.0);
 
   pelec::odtles::ODTManager odt_manager;
-  pelec::odtles::ODTParams params{};
+  pelec::odtles::ODTParams params = runtime_params_in;
   params.enabled = true;
-  params.max_local_substeps = 1;
+  if (params.max_local_substeps <= 0) {
+    params.max_local_substeps = 1;
+  }
   odt_manager.setParams(params);
 
   const amrex::Array<const amrex::MultiFab*, AMREX_SPACEDIM> area_ptr = {
@@ -459,6 +550,13 @@ computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
   sig.stepped_entries = stats.stepped_entries;
   sig.moment_columns_built = stats.moment_columns_built;
   return sig;
+}
+
+RuntimeSignature
+computeRuntimeODTLESTermSignature(amrex::MultiFab& lterm_out)
+{
+  const pelec::odtles::ODTParams params{};
+  return computeRuntimeODTLESTermSignature(lterm_out, params);
 }
 
 void
@@ -558,6 +656,604 @@ TEST(ODTLESLocalEngine, MomentExtractorMVPValidation)
   EXPECT_LE(rep.overlap_weight_sum_error, tol);
   EXPECT_LE(rep.owner_recovery_max_abs_error, tol);
   EXPECT_LE(rep.tau_max_abs, tol);
+}
+
+TEST(ODTLESLocalEngine, ODTLineStateExtendedSpeciesConstructionResetCopy)
+{
+  pelec::odtles::ODTLineState line_state;
+  line_state.initializeForValidation(2);
+  ASSERT_TRUE(line_state.initialized());
+  ASSERT_EQ(line_state.numCells(), 2);
+
+  auto c0 = line_state.cell(0);
+  c0.rho = 2.0;
+  c0.rhou = 1.0;
+  c0.rhov = -0.5;
+  c0.rhow = 0.25;
+  c0.rhoE = 8.0;
+  ASSERT_EQ(c0.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c0.rhoY[static_cast<std::size_t>(n)] = 0.1 * static_cast<amrex::Real>(n + 1);
+  }
+  line_state.setCell(0, c0);
+  line_state.setValid(true);
+
+  const auto vel = line_state.velocities(0);
+  EXPECT_DOUBLE_EQ(vel[0], 0.5);
+#if AMREX_SPACEDIM >= 2
+  EXPECT_DOUBLE_EQ(vel[1], -0.25);
+#endif
+#if AMREX_SPACEDIM == 3
+  EXPECT_DOUBLE_EQ(vel[2], 0.125);
+#endif
+
+  pelec::odtles::ODTLineState copied = line_state;
+  ASSERT_TRUE(copied.initialized());
+  ASSERT_TRUE(copied.valid());
+  ASSERT_EQ(copied.numCells(), line_state.numCells());
+  ASSERT_EQ(
+    copied.cell(0).rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_DOUBLE_EQ(
+      copied.cell(0).rhoY[static_cast<std::size_t>(n)],
+      line_state.cell(0).rhoY[static_cast<std::size_t>(n)]);
+  }
+
+  line_state.reset();
+  EXPECT_FALSE(line_state.initialized());
+  EXPECT_FALSE(line_state.valid());
+  EXPECT_EQ(line_state.numCells(), 0);
+}
+
+TEST(ODTLESLocalEngine, ODTLineStateSpeciesMassFractionRecovery)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  pelec::odtles::ODTLineState line_state;
+  line_state.initializeForValidation(1);
+
+  ConservativeCell c{};
+  c.rho = 2.5;
+  c.rhou = 0.75;
+  c.rhov = -0.25;
+  c.rhow = 0.5;
+  c.rhoE = 9.0;
+  ASSERT_EQ(c.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] =
+      0.05 * static_cast<amrex::Real>(n + 1);
+  }
+  line_state.setCell(0, c);
+
+  const auto Y = line_state.speciesMassFractions(0);
+  ASSERT_EQ(Y.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    const amrex::Real expected =
+      c.rhoY[static_cast<std::size_t>(n)] / c.rho;
+    EXPECT_NEAR(line_state.speciesMassFraction(0, n), expected, tol);
+    EXPECT_NEAR(Y[static_cast<std::size_t>(n)], expected, tol);
+  }
+}
+
+TEST(ODTLESLocalEngine, ODTLineStateAdmissibilityChecksDensityAndSpecies)
+{
+  pelec::odtles::ODTLineState line_state;
+  line_state.initializeForValidation(3);
+
+  ConservativeCell admissible{};
+  admissible.rho = 1.0;
+  admissible.rhou = 0.2;
+  admissible.rhov = -0.1;
+  admissible.rhow = 0.05;
+  admissible.rhoE = 4.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    admissible.rhoY[static_cast<std::size_t>(n)] =
+      0.01 * static_cast<amrex::Real>(n + 1);
+  }
+  line_state.setCell(0, admissible);
+  EXPECT_TRUE(line_state.hasExpectedSpeciesContainerSize(0));
+  EXPECT_TRUE(line_state.isCellAdmissible(0));
+
+  ConservativeCell neg_rho = admissible;
+  neg_rho.rho = -1.0;
+  line_state.setCell(1, neg_rho);
+  EXPECT_FALSE(line_state.isCellAdmissible(1));
+
+  ConservativeCell bad_species = admissible;
+  if (NUM_SPECIES > 0) {
+    bad_species.rhoY[0] = -1.0e-6;
+  } else {
+    bad_species.rhoY.push_back(0.0);
+  }
+  line_state.setCell(2, bad_species);
+  EXPECT_FALSE(line_state.isCellAdmissible(2));
+
+  ConservativeCell bad_size = admissible;
+  bad_size.rhoY.resize(static_cast<std::size_t>(NUM_SPECIES + 1), 0.0);
+  line_state.setCell(1, bad_size);
+  EXPECT_FALSE(line_state.hasExpectedSpeciesContainerSize(1));
+  EXPECT_FALSE(line_state.isCellAdmissible(1));
+}
+
+TEST(ODTLESLocalEngine, ODTThermoBridgeRecoversNormalizedSpeciesAndDerivedState)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  pelec::odtles::ODTLineState line_state;
+  line_state.initializeForValidation(1);
+
+  ConservativeCell c{};
+  c.rho = 2.0;
+  c.rhou = 0.8;
+  c.rhov = -0.2;
+  c.rhow = 0.4;
+  c.rhoE = 10.0;
+  amrex::Real species_sum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] = 0.05 * static_cast<amrex::Real>(n + 1);
+    species_sum += c.rhoY[static_cast<std::size_t>(n)];
+  }
+  line_state.setCell(0, c);
+
+  const auto rec = pelec::odtles::ODTThermoBridge::recoverCellThermoState(
+    line_state, 0);
+  ASSERT_TRUE(rec.success)
+    << pelec::odtles::ODTThermoBridge::failureModeString(rec.failure_mode);
+
+  EXPECT_NEAR(rec.velocity[0], c.rhou / c.rho, tol);
+#if AMREX_SPACEDIM >= 2
+  EXPECT_NEAR(rec.velocity[1], c.rhov / c.rho, tol);
+#endif
+#if AMREX_SPACEDIM == 3
+  EXPECT_NEAR(rec.velocity[2], c.rhow / c.rho, tol);
+#endif
+
+  amrex::Real sum_rhoY = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    const amrex::Real expected_Y =
+      c.rhoY[static_cast<std::size_t>(n)] / species_sum;
+    EXPECT_NEAR(rec.Y[static_cast<std::size_t>(n)], expected_Y, tol);
+    EXPECT_NEAR(rec.rhoY[static_cast<std::size_t>(n)], c.rho * expected_Y, tol);
+    sum_rhoY += rec.rhoY[static_cast<std::size_t>(n)];
+  }
+  EXPECT_NEAR(sum_rhoY, c.rho, tol);
+
+  const amrex::Real u = c.rhou / c.rho;
+  const amrex::Real v = c.rhov / c.rho;
+  const amrex::Real w = c.rhow / c.rho;
+  const amrex::Real expected_kinetic =
+    0.5 * AMREX_D_TERM(u * u, +v * v, +w * w);
+  const amrex::Real expected_e = c.rhoE / c.rho - expected_kinetic;
+  EXPECT_NEAR(rec.kinetic_energy, expected_kinetic, tol);
+  EXPECT_NEAR(rec.specific_internal_energy, expected_e, tol);
+}
+
+TEST(ODTLESLocalEngine, ODTThermoBridgeTemperatureMatchesHostEOS)
+{
+  constexpr amrex::Real tol = 1.0e-8;
+  auto eos = pele::physics::PhysicsType::eos();
+
+  ConservativeCell c{};
+  c.rho = 1.7;
+  constexpr amrex::Real T_ref = 420.0;
+  amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+  amrex::Real ysum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] = static_cast<amrex::Real>(n + 1);
+    ysum += Y_ref[n];
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] /= ysum;
+    c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+  }
+
+  amrex::Real e_ref = 0.0;
+  eos.RTY2E(c.rho, T_ref, Y_ref, e_ref);
+  const amrex::Real u = 0.2;
+  const amrex::Real v = -0.1;
+  const amrex::Real w = 0.05;
+  c.rhou = c.rho * u;
+  c.rhov = c.rho * v;
+  c.rhow = c.rho * w;
+  c.rhoE = c.rho * (e_ref + 0.5 * (u * u + v * v + w * w));
+
+  const auto rec = pelec::odtles::ODTThermoBridge::recoverCellThermoState(c);
+  ASSERT_TRUE(rec.success)
+    << pelec::odtles::ODTThermoBridge::failureModeString(rec.failure_mode);
+  EXPECT_NEAR(rec.temperature, T_ref, tol);
+
+  amrex::Real T_eos = 0.0;
+  eos.REY2T(c.rho, rec.specific_internal_energy, rec.Y.data(), T_eos);
+  EXPECT_NEAR(rec.temperature, T_eos, tol);
+}
+
+TEST(ODTLESLocalEngine, ODTThermoBridgeNegativeSpeciesRepairOrFail)
+{
+  ConservativeCell c{};
+  c.rho = 1.5;
+  c.rhou = 0.15;
+  c.rhov = -0.03;
+  c.rhow = 0.06;
+  c.rhoE = 4.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] = 0.0;
+  }
+  if (NUM_SPECIES > 0) {
+    c.rhoY[0] = -0.2;
+  }
+  if (NUM_SPECIES > 1) {
+    c.rhoY[1] = 0.4;
+  }
+  for (int n = 2; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] = 0.1;
+  }
+
+  const auto rec = pelec::odtles::ODTThermoBridge::recoverCellThermoState(c);
+  if (NUM_SPECIES > 1) {
+    ASSERT_TRUE(rec.success)
+      << pelec::odtles::ODTThermoBridge::failureModeString(rec.failure_mode);
+    EXPECT_GE(rec.rhoY[0], 0.0);
+    EXPECT_EQ(rec.rhoY[0], 0.0);
+  } else {
+    EXPECT_FALSE(rec.success);
+    EXPECT_EQ(
+      rec.failure_mode,
+      pelec::odtles::ODTThermoBridge::FailureMode::NonPositiveSpeciesSum);
+  }
+}
+
+TEST(ODTLESLocalEngine, ODTThermoBridgeFailsOnNonPositiveSpeciesSum)
+{
+  ConservativeCell c{};
+  c.rho = 1.1;
+  c.rhou = 0.0;
+  c.rhov = 0.0;
+  c.rhow = 0.0;
+  c.rhoE = 2.5;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    c.rhoY[static_cast<std::size_t>(n)] = -1.0e-3;
+  }
+
+  const auto rec = pelec::odtles::ODTThermoBridge::recoverCellThermoState(c);
+  EXPECT_FALSE(rec.success);
+  EXPECT_EQ(
+    rec.failure_mode,
+    pelec::odtles::ODTThermoBridge::FailureMode::NonPositiveSpeciesSum);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTDiffusionMolecularViscosityProfileMatchesHostTransportAndIsNonNegative)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  pelec::odtles::ODTLineState line_state;
+  line_state.initialize(line_geom);
+
+  auto eos = pele::physics::PhysicsType::eos();
+  const int n_cells = line_state.numCells();
+  for (int i = 0; i < n_cells; ++i) {
+    ConservativeCell c{};
+    c.rho = 1.0 + 0.2 * static_cast<amrex::Real>(i);
+
+    amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+    amrex::Real ysum = 0.0;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      Y_ref[n] = static_cast<amrex::Real>(n + 1);
+      ysum += Y_ref[n];
+    }
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      Y_ref[n] /= ysum;
+      c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+    }
+
+    const amrex::Real T_ref = 360.0 + 20.0 * static_cast<amrex::Real>(i);
+    amrex::Real e_ref = 0.0;
+    eos.RTY2E(c.rho, T_ref, Y_ref, e_ref);
+
+    const amrex::Real u = 0.05 * static_cast<amrex::Real>(i + 1);
+    const amrex::Real v = -0.03 * static_cast<amrex::Real>(i + 1);
+    const amrex::Real w = 0.02 * static_cast<amrex::Real>(i + 1);
+    c.rhou = c.rho * u;
+    c.rhov = c.rho * v;
+    c.rhow = c.rho * w;
+    c.rhoE = c.rho * (e_ref + 0.5 * (u * u + v * v + w * w));
+    line_state.setCell(i, c);
+  }
+  line_state.setValid(true);
+
+  const auto profile =
+    pelec::odtles::ODTDiffusion::buildMomentumViscosityProfile(line_state);
+  ASSERT_TRUE(profile.success);
+  ASSERT_EQ(
+    static_cast<int>(profile.dynamic_viscosity_mu.size()), line_state.numCells());
+
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    const auto rec = pelec::odtles::ODTThermoBridge::recoverCellThermoState(
+      line_state, i);
+    ASSERT_TRUE(rec.success)
+      << pelec::odtles::ODTThermoBridge::failureModeString(rec.failure_mode);
+    const amrex::Real mu_ref = hostDynamicViscosityFromRecoveredState(rec);
+    EXPECT_NEAR(
+      profile.dynamic_viscosity_mu[static_cast<std::size_t>(i)], mu_ref, tol);
+    EXPECT_GE(profile.dynamic_viscosity_mu[static_cast<std::size_t>(i)], 0.0);
+  }
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTDiffusionDefaultControlsUseProductionMolecularMomentumPath)
+{
+  const pelec::odtles::ODTDiffusion::Controls ctrl{};
+  EXPECT_TRUE(ctrl.use_molecular_viscosity_for_momentum);
+  EXPECT_EQ(
+    ctrl.momentum_molecular_form,
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux);
+  EXPECT_TRUE(ctrl.fail_on_molecular_viscosity_recovery_failure);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeStepperControlPlumbingEnforcesProductionMolecularModel)
+{
+  pelec::odtles::ODTParams params{};
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  pelec::odtles::configureRuntimeODTStepperControls(params, step_ctrl);
+
+  EXPECT_EQ(step_ctrl.max_internal_iterations, 1);
+  EXPECT_TRUE(step_ctrl.diffusion_controls.use_molecular_viscosity_for_momentum);
+  EXPECT_EQ(
+    step_ctrl.diffusion_controls.momentum_molecular_form,
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux);
+  EXPECT_DOUBLE_EQ(step_ctrl.diffusion_controls.molecular_viscosity_floor, 0.0);
+  EXPECT_TRUE(
+    step_ctrl.diffusion_controls.fail_on_molecular_viscosity_recovery_failure);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeStepperControlPlumbingOnlyExposesSubstepCountTuning)
+{
+  pelec::odtles::ODTParams params{};
+  params.max_local_substeps = 7;
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  pelec::odtles::configureRuntimeODTStepperControls(params, step_ctrl);
+
+  EXPECT_EQ(step_ctrl.max_internal_iterations, 7);
+  EXPECT_TRUE(step_ctrl.diffusion_controls.use_molecular_viscosity_for_momentum);
+  EXPECT_EQ(
+    step_ctrl.diffusion_controls.momentum_molecular_form,
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux);
+  EXPECT_DOUBLE_EQ(step_ctrl.diffusion_controls.molecular_viscosity_floor, 0.0);
+  EXPECT_TRUE(
+    step_ctrl.diffusion_controls.fail_on_molecular_viscosity_recovery_failure);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTDiffusionNonUniformDensityDistinguishesConservativeAndVelocityGradientForms)
+{
+  constexpr amrex::Real tol_quiet = 1.0e-12;
+  constexpr amrex::Real tol_active = 1.0e-10;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  pelec::odtles::ODTLineState base_state;
+  base_state.initialize(line_geom);
+  auto eos = pele::physics::PhysicsType::eos();
+
+  const amrex::Real u_const = 0.7;
+  amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+  amrex::Real ysum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] = static_cast<amrex::Real>(n + 1);
+    ysum += Y_ref[n];
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] /= ysum;
+  }
+
+  for (int i = 0; i < base_state.numCells(); ++i) {
+    ConservativeCell c{};
+    const amrex::Real ii = static_cast<amrex::Real>(i);
+    c.rho = 1.0 + 0.25 * ii * ii;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+    }
+    amrex::Real e_ref = 0.0;
+    eos.RTY2E(c.rho, 430.0, Y_ref, e_ref);
+    c.rhou = c.rho * u_const;
+    c.rhov = 0.0;
+    c.rhow = 0.0;
+    c.rhoE = c.rho * (e_ref + 0.5 * u_const * u_const);
+    base_state.setCell(i, c);
+  }
+  base_state.setValid(true);
+
+  pelec::odtles::ODTDiffusion::Controls ctrl{};
+  ctrl.diffuse_component.fill(false);
+  ctrl.diffuse_component[static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU)] =
+    true;
+  ctrl.use_molecular_viscosity_for_momentum = true;
+  ctrl.molecular_viscosity_floor = 1.0;
+  ctrl.fail_on_molecular_viscosity_recovery_failure = true;
+
+  const auto mu_profile =
+    pelec::odtles::ODTDiffusion::buildMomentumViscosityProfile(base_state);
+  ASSERT_TRUE(mu_profile.success);
+  amrex::Real max_mu = 0.0;
+  for (const auto mu : mu_profile.dynamic_viscosity_mu) {
+    if (mu > max_mu) {
+      max_mu = mu;
+    }
+  }
+
+  pelec::odtles::ODTLineState conservative_form_state = base_state;
+  ctrl.momentum_molecular_form =
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::ConservativeVariableNuOnRhoU;
+  pelec::odtles::ODTDiffusion::applyImplicitUniform(
+    line_geom, conservative_form_state, 1.0e-2, ctrl);
+
+  pelec::odtles::ODTLineState velocity_flux_state = base_state;
+  ctrl.momentum_molecular_form =
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux;
+  pelec::odtles::ODTDiffusion::applyImplicitUniform(
+    line_geom, velocity_flux_state, 1.0e-2, ctrl);
+
+  const int comp_rhou = static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU);
+  const amrex::Real conservative_change = maxAbsMomentumComponentChange(
+    base_state, conservative_form_state, comp_rhou);
+  const amrex::Real velocity_flux_change = maxAbsMomentumComponentChange(
+    base_state, velocity_flux_state, comp_rhou);
+
+  // u is uniform: velocity-gradient viscous flux should be quiescent.
+  EXPECT_LE(velocity_flux_change, tol_quiet);
+  // Conservative-variable nu_eff diffusion operates on rho*u and changes state.
+  EXPECT_GT(conservative_change, tol_active)
+    << "max_mu=" << max_mu << " (zero molecular viscosity gives zero update)";
+}
+
+TEST(ODTLESLocalEngine, SupportDataSamplingTransfersConservativeSpeciesFromLES)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  amrex::BoxArray ba(domain);
+  amrex::DistributionMapping dm(ba);
+
+  amrex::MultiFab state_valid(ba, dm, NVAR, 0);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, 1);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, 1);
+  state_valid.setVal(0.0);
+  state_same_level.setVal(0.0);
+  state_host_filled.setVal(0.0);
+
+  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
+    const auto vbx = mfi.validbox();
+    auto const s = state_valid.array(mfi);
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv)) {
+      const amrex::Real x = static_cast<amrex::Real>(iv[0]);
+      s(iv, URHO) = 1.0 + 0.1 * x;
+      s(iv, UMX) = 0.2 + 0.03 * x;
+      s(iv, UMY) = -0.1 + 0.02 * x;
+      s(iv, UMZ) = 0.05 + 0.01 * x;
+      s(iv, UEDEN) = 3.0 + 0.2 * x;
+      for (int n = 0; n < NUM_SPECIES; ++n) {
+        s(iv, UFS + n) =
+          0.01 * static_cast<amrex::Real>(n + 1) * (1.0 + x);
+      }
+    }
+  }
+  amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
+  state_same_level.FillBoundary(geom.periodicity());
+  amrex::MultiFab::Copy(
+    state_host_filled, state_same_level, 0, 0, NVAR, state_same_level.nGrow());
+
+  pelec::odtles::ODTManager odt_manager;
+  odt_manager.initializeLevel(0, ba, dm);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+  const pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  const auto support_data = odt_manager.collectSupportData(
+    line_geom, geom, state_valid, state_same_level, state_host_filled);
+
+  ASSERT_TRUE(support_data.allSameLevelAccepted());
+  ASSERT_EQ(
+    static_cast<int>(support_data.ordered_samples.size()),
+    line_geom.supportCellCount());
+  for (const auto& sample : support_data.ordered_samples) {
+    ASSERT_TRUE(sample.has_value);
+    ASSERT_EQ(sample.value.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+    const amrex::Real x = static_cast<amrex::Real>(sample.iv[0]);
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      const amrex::Real expected =
+        0.01 * static_cast<amrex::Real>(n + 1) * (1.0 + x);
+      EXPECT_NEAR(sample.value.rhoY[static_cast<std::size_t>(n)], expected, tol);
+    }
+  }
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTLineInitializationFromLocalSupportIncludesSpeciesConservativeState)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  std::vector<ConservativeCell> support(
+    static_cast<std::size_t>(line_geom.supportCellCount()));
+  const int i_m = supportIndexForOffset(line_geom, -1);
+  const int i_0 = supportIndexForOffset(line_geom, 0);
+  const int i_p = supportIndexForOffset(line_geom, 1);
+  ASSERT_GE(i_m, 0);
+  ASSERT_GE(i_0, 0);
+  ASSERT_GE(i_p, 0);
+
+  support[static_cast<std::size_t>(i_m)] = makeCell(1.0, 0.40, -0.15, 0.30, 4.2);
+  support[static_cast<std::size_t>(i_0)] = makeCell(1.5, 0.60, -0.05, 0.45, 4.8);
+  support[static_cast<std::size_t>(i_p)] = makeCell(2.2, 0.95, 0.10, 0.62, 5.9);
+  setSpeciesSequence(support[static_cast<std::size_t>(i_m)], 0.01);
+  setSpeciesSequence(support[static_cast<std::size_t>(i_0)], 0.02);
+  setSpeciesSequence(support[static_cast<std::size_t>(i_p)], 0.03);
+
+  pelec::odtles::ODTLineState line_state;
+  pelec::odtles::ODTReconcile::initializeLineStateFromLESSupportAverages(
+    line_geom, support, line_state);
+
+  ASSERT_TRUE(line_state.initialized());
+  ASSERT_TRUE(line_state.valid());
+  const auto& c_m = line_state.cell(i_m);
+  const auto& c_0 = line_state.cell(i_0);
+  const auto& c_p = line_state.cell(i_p);
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      c_m.rhoY[static_cast<std::size_t>(n)],
+      support[static_cast<std::size_t>(i_m)].rhoY[static_cast<std::size_t>(n)],
+      tol);
+    EXPECT_NEAR(
+      c_0.rhoY[static_cast<std::size_t>(n)],
+      support[static_cast<std::size_t>(i_0)].rhoY[static_cast<std::size_t>(n)],
+      tol);
+    EXPECT_NEAR(
+      c_p.rhoY[static_cast<std::size_t>(n)],
+      support[static_cast<std::size_t>(i_p)].rhoY[static_cast<std::size_t>(n)],
+      tol);
+  }
+
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    ASSERT_EQ(
+      line_state.cell(i).rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      EXPECT_GE(line_state.cell(i).rhoY[static_cast<std::size_t>(n)], 0.0);
+    }
+  }
 }
 
 TEST(ODTLESLocalEngine, ODTLineInitializationFromLocalSupportIsNonConstant)
@@ -674,6 +1370,10 @@ TEST(
       s(iv, UMY) = -0.12 + 0.02 * x;
       s(iv, UMZ) = 0.06 + 0.01 * x;
       s(iv, UEDEN) = 4.0 + 0.3 * x;
+      for (int n = 0; n < NUM_SPECIES; ++n) {
+        s(iv, UFS + n) =
+          0.01 * static_cast<amrex::Real>(n + 1) * (2.0 + x);
+      }
     }
   }
   amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
@@ -703,7 +1403,8 @@ TEST(
   const amrex::Real old_owner_rho = entry0->state.cell(owner_local).rho;
   EXPECT_GT(std::abs(old_left_rho - old_owner_rho), tol);
 
-  const ConservativeCell target = makeCell(1.85, 0.37, -0.01, 0.095, 5.4);
+  ConservativeCell target = makeCell(1.85, 0.37, -0.01, 0.095, 5.4);
+  setSpeciesSequence(target, 0.015, 0.001);
   setConservativeAt(state_valid, owner, target);
   setConservativeAt(state_same_level, owner, target);
   setConservativeAt(state_host_filled, owner, target);
@@ -723,6 +1424,12 @@ TEST(
   EXPECT_NEAR(owner_cell.rhov, target.rhov, tol);
   EXPECT_NEAR(owner_cell.rhow, target.rhow, tol);
   EXPECT_NEAR(owner_cell.rhoE, target.rhoE, tol);
+  ASSERT_EQ(owner_cell.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      owner_cell.rhoY[static_cast<std::size_t>(n)],
+      target.rhoY[static_cast<std::size_t>(n)], tol);
+  }
 
   // Reconcile path preserves residual structure away from owner instead of
   // reinitializing all support cells to owner target.
@@ -752,15 +1459,19 @@ TEST(ODTLESLocalEngine, ODTLineReconcilePreservesResidualWithAlphaReduction)
   ASSERT_GE(i_0, 0);
   ASSERT_GE(i_p, 0);
 
-  const ConservativeCell old_owner = makeCell(1.0, 0.40, 0.20, -0.10, 4.0);
-  const ConservativeCell old_left = makeCell(0.2, 0.08, 0.04, -0.02, 0.8);
-  const ConservativeCell old_right = makeCell(1.6, 0.64, 0.32, -0.16, 6.4);
+  ConservativeCell old_owner = makeCell(1.0, 0.40, 0.20, -0.10, 4.0);
+  ConservativeCell old_left = makeCell(0.2, 0.08, 0.04, -0.02, 0.8);
+  ConservativeCell old_right = makeCell(1.6, 0.64, 0.32, -0.16, 6.4);
+  setSpeciesSequence(old_owner, 0.12);
+  setSpeciesSequence(old_left, 0.02);
+  setSpeciesSequence(old_right, 0.24);
   line_state.setCell(i_m, old_left);
   line_state.setCell(i_0, old_owner);
   line_state.setCell(i_p, old_right);
   line_state.setValid(true);
 
-  const ConservativeCell target = makeCell(0.3, 0.12, 0.06, -0.03, 1.2);
+  ConservativeCell target = makeCell(0.3, 0.12, 0.06, -0.03, 1.2);
+  setSpeciesSequence(target, 0.03);
   pelec::odtles::ODTReconcile::ReconcileControls ctrl{};
   ctrl.rho_floor = 0.15;
   ctrl.e_floor = 1.0e-4;
@@ -785,6 +1496,12 @@ TEST(ODTLESLocalEngine, ODTLineReconcilePreservesResidualWithAlphaReduction)
   EXPECT_NEAR(new_owner.rhov, target.rhov, tol);
   EXPECT_NEAR(new_owner.rhow, target.rhow, tol);
   EXPECT_NEAR(new_owner.rhoE, target.rhoE, tol);
+  ASSERT_EQ(new_owner.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      new_owner.rhoY[static_cast<std::size_t>(n)],
+      target.rhoY[static_cast<std::size_t>(n)], tol);
+  }
 
   const auto target_v = asArray(target);
   const auto new_left_v = asArray(line_state.cell(i_m));
@@ -811,6 +1528,10 @@ TEST(ODTLESLocalEngine, ODTLineReconcilePreservesResidualWithAlphaReduction)
     const auto c = line_state.cell(i);
     EXPECT_GT(c.rho, ctrl.rho_floor);
     EXPECT_GT(specificInternalEnergy(c), ctrl.e_floor);
+    ASSERT_EQ(c.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      EXPECT_GE(c.rhoY[static_cast<std::size_t>(n)], 0.0);
+    }
   }
 }
 
@@ -1036,6 +1757,110 @@ TEST(ODTLESLocalEngine, ConservativeMomentumDepositionPartitionConsistency)
     EXPECT_NEAR(valueAt(lterm_single, iv, UMZ), valueAt(lterm_split, iv, UMZ), tol);
     EXPECT_NEAR(valueAt(lterm_single, iv, UEDEN), valueAt(lterm_split, iv, UEDEN), tol);
   }
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeODTMomentumDepositionDefaultConfigMatchesExplicitCanonicalControls)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  amrex::MultiFab lterm_default;
+  amrex::MultiFab lterm_explicit;
+
+  const pelec::odtles::ODTParams params_default{};
+  const RuntimeSignature sig_default =
+    computeRuntimeODTLESTermSignature(lterm_default, params_default);
+
+  pelec::odtles::ODTParams params_explicit{};
+  params_explicit.max_local_substeps = 1;
+  const RuntimeSignature sig_explicit =
+    computeRuntimeODTLESTermSignature(lterm_explicit, params_explicit);
+
+  EXPECT_NEAR(sig_default.sum_umx, sig_explicit.sum_umx, tol);
+  EXPECT_NEAR(sig_default.sum_umy, sig_explicit.sum_umy, tol);
+  EXPECT_NEAR(sig_default.sum_umz, sig_explicit.sum_umz, tol);
+  EXPECT_NEAR(sig_default.sum_ueden, sig_explicit.sum_ueden, tol);
+  EXPECT_NEAR(sig_default.l1_umx, sig_explicit.l1_umx, tol);
+  EXPECT_NEAR(sig_default.l1_umy, sig_explicit.l1_umy, tol);
+  EXPECT_NEAR(sig_default.l1_umz, sig_explicit.l1_umz, tol);
+  EXPECT_NEAR(sig_default.l1_ueden, sig_explicit.l1_ueden, tol);
+  EXPECT_NEAR(sig_default.l1_others, sig_explicit.l1_others, tol);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeMolecularMomentumPathUsesProductionFormAndAllowsDebugComparisonOverride)
+{
+  constexpr amrex::Real tol_quiet = 1.0e-12;
+  constexpr amrex::Real tol_active = 1.0e-10;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  pelec::odtles::ODTLineState base_state;
+  base_state.initialize(line_geom);
+  auto eos = pele::physics::PhysicsType::eos();
+
+  const amrex::Real u_const = 0.65;
+  amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+  amrex::Real ysum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] = static_cast<amrex::Real>(n + 1);
+    ysum += Y_ref[n];
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] /= ysum;
+  }
+  for (int i = 0; i < base_state.numCells(); ++i) {
+    ConservativeCell c{};
+    const amrex::Real ii = static_cast<amrex::Real>(i);
+    c.rho = 1.0 + 0.3 * ii * ii;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+    }
+    amrex::Real e_ref = 0.0;
+    eos.RTY2E(c.rho, 410.0, Y_ref, e_ref);
+    c.rhou = c.rho * u_const;
+    c.rhov = 0.0;
+    c.rhow = 0.0;
+    c.rhoE = c.rho * (e_ref + 0.5 * u_const * u_const);
+    base_state.setCell(i, c);
+  }
+  base_state.setValid(true);
+
+  pelec::odtles::ODTParams params{};
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  pelec::odtles::configureRuntimeODTStepperControls(params, step_ctrl);
+  EXPECT_EQ(
+    step_ctrl.diffusion_controls.momentum_molecular_form,
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::VelocityGradientMuFlux);
+  step_ctrl.diffusion_controls.molecular_viscosity_floor = 1.0;
+
+  pelec::odtles::ODTLineState production_state = base_state;
+  pelec::odtles::ODTDiffusion::applyImplicitUniform(
+    line_geom, production_state, 1.0e-2, step_ctrl.diffusion_controls);
+
+  auto debug_diff_ctrl = step_ctrl.diffusion_controls;
+  debug_diff_ctrl.momentum_molecular_form =
+    pelec::odtles::ODTDiffusion::MomentumMolecularForm::ConservativeVariableNuOnRhoU;
+  pelec::odtles::ODTLineState debug_state = base_state;
+  pelec::odtles::ODTDiffusion::applyImplicitUniform(
+    line_geom, debug_state, 1.0e-2, debug_diff_ctrl);
+
+  const int comp_rhou = static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU);
+  const amrex::Real change_production = maxAbsMomentumComponentChange(
+    base_state, production_state, comp_rhou);
+  const amrex::Real change_debug = maxAbsMomentumComponentChange(
+    base_state, debug_state, comp_rhou);
+
+  EXPECT_LE(change_production, tol_quiet);
+  EXPECT_GT(change_debug, tol_active);
 }
 
 TEST(ODTLESLocalEngine, RuntimeODTMomentumDepositionMPIBudget)

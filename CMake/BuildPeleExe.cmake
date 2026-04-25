@@ -83,6 +83,18 @@ function(build_pele_exe pele_exe_name pele_physics_lib_name)
        ${SRC_DIR}/Utilities.cpp
        ${SRC_DIR}/WENO.H
        ${SRC_DIR}/RotSource.cpp
+       ${SRC_DIR}/ODTLES/ODTManager.cpp
+       ${SRC_DIR}/ODTLES/ODTParams.cpp
+       ${SRC_DIR}/ODTLES/ODTLineState.cpp
+       ${SRC_DIR}/ODTLES/ODTLineGeometry.cpp
+       ${SRC_DIR}/ODTLES/ODTReconcile.cpp
+       ${SRC_DIR}/ODTLES/ODTDiffusion.cpp
+       ${SRC_DIR}/ODTLES/ODTKernel.cpp
+       ${SRC_DIR}/ODTLES/ODTTripletMap.cpp
+       ${SRC_DIR}/ODTLES/ODTEventSampler.cpp
+       ${SRC_DIR}/ODTLES/ODTStepper.cpp
+       ${SRC_DIR}/ODTLES/ODTMomentExtractor.cpp
+       ${SRC_DIR}/ODTLES/ODTThermoBridge.cpp
   )
 
   if(PELE_PHYSICS_ENABLE_SPRAY)

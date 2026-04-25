@@ -82,6 +82,57 @@ pp.query("Cs", Cs);
 pp.query("Cw", Cw);
 pp.query("CI", CI);
 pp.query("PrT", PrT);
+pp.query("odt_max_local_substeps", odt_max_local_substeps);
+{
+  bool deprecated_flag = false;
+  if (pp.query("odt_enable_thermochemical_recovery", deprecated_flag)) {
+    amrex::Print()
+      << "WARNING: pelec.odt_enable_thermochemical_recovery is deprecated and "
+         "ignored; runtime ODT line momentum diffusion now always uses "
+         "thermochemical recovery."
+      << std::endl;
+  }
+}
+{
+  bool deprecated_flag = false;
+  if (pp.query(
+        "odt_enable_molecular_viscosity_momentum_diffusion", deprecated_flag)) {
+    amrex::Print()
+      << "WARNING: pelec.odt_enable_molecular_viscosity_momentum_diffusion is "
+         "deprecated and ignored; runtime ODT line momentum diffusion now "
+         "always uses host molecular viscosity."
+      << std::endl;
+  }
+}
+{
+  int deprecated_form = 1;
+  if (pp.query("odt_molecular_momentum_form", deprecated_form)) {
+    amrex::Print()
+      << "WARNING: pelec.odt_molecular_momentum_form is deprecated and ignored; "
+         "runtime ODT line momentum diffusion always uses velocity-gradient "
+         "mu-flux form."
+      << std::endl;
+  }
+}
+{
+  amrex::Real deprecated_floor = 0.0;
+  if (pp.query("odt_molecular_viscosity_floor", deprecated_floor)) {
+    amrex::Print()
+      << "WARNING: pelec.odt_molecular_viscosity_floor is deprecated and "
+         "ignored in production runtime."
+      << std::endl;
+  }
+}
+{
+  bool deprecated_fail = false;
+  if (pp.query("odt_fail_on_molecular_viscosity_recovery_failure", deprecated_fail)) {
+    amrex::Print()
+      << "WARNING: pelec.odt_fail_on_molecular_viscosity_recovery_failure is "
+         "deprecated and ignored; runtime now enforces thermochemical "
+         "recovery for the molecular momentum path."
+      << std::endl;
+  }
+}
 pp.query("eb_boundary_T", eb_boundary_T);
 pp.query("eb_isothermal", eb_isothermal);
 pp.query("eb_noslip", eb_noslip);

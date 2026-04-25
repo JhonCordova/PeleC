@@ -13,6 +13,7 @@
 #include <AMReX_MultiFab.H>
 
 #include "ODTManager.H"
+#include "ODTStepper.H"
 
 namespace pelec::odtles
 {
@@ -77,6 +78,13 @@ accumulateRuntimeODTMomentumLESTerm(
   amrex::Real dt,
   amrex::MultiFab& LESTerm,
   const FluxRegisterUpdater& reflux_updater = FluxRegisterUpdater{});
+
+// Map host-configured ODT runtime parameters onto stepper controls and enforce
+// the production ODT molecular momentum diffusion model.
+// This function is intentionally centralized for runtime and test consistency.
+void
+configureRuntimeODTStepperControls(
+  const ODTParams& odt_params, ODTStepper::Controls& step_ctrl);
 
 } // namespace pelec::odtles
 

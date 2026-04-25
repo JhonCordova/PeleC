@@ -1,5 +1,6 @@
 #include "ODTLineState.H"
 
+#include <array>
 #include <stdexcept>
 
 #include <AMReX.H>
@@ -15,6 +16,14 @@ checkCellIndex(int i, int n)
 {
   if (i < 0 || i >= n) {
     throw std::out_of_range("ODTLineState cell index out of range");
+  }
+}
+
+void
+checkSpeciesIndex(int n)
+{
+  if (n < 0 || n >= NUM_SPECIES) {
+    throw std::out_of_range("ODTLineState species index out of range");
   }
 }
 
@@ -97,6 +106,61 @@ ODTLineState::velocityW(int i) const
 {
   const auto& s = cell(i);
   return (s.rho != 0.0) ? (s.rhow / s.rho) : 0.0;
+}
+
+std::array<amrex::Real, AMREX_SPACEDIM>
+ODTLineState::velocities(int i) const
+{
+  return {AMREX_D_DECL(velocityU(i), velocityV(i), velocityW(i))};
+}
+
+amrex::Real
+ODTLineState::speciesMassFraction(int i, int n) const
+{
+  checkSpeciesIndex(n);
+  const auto& s = cell(i);
+  if (s.rho == 0.0 || s.rhoY.size() != static_cast<std::size_t>(NUM_SPECIES)) {
+    return 0.0;
+  }
+  return s.rhoY[static_cast<std::size_t>(n)] / s.rho;
+}
+
+std::vector<amrex::Real>
+ODTLineState::speciesMassFractions(int i) const
+{
+  std::vector<amrex::Real> Y(static_cast<std::size_t>(NUM_SPECIES), 0.0);
+  if (!hasExpectedSpeciesContainerSize(i)) {
+    return Y;
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y[static_cast<std::size_t>(n)] = speciesMassFraction(i, n);
+  }
+  return Y;
+}
+
+bool
+ODTLineState::hasExpectedSpeciesContainerSize(int i) const
+{
+  const auto& s = cell(i);
+  return s.rhoY.size() == static_cast<std::size_t>(NUM_SPECIES);
+}
+
+bool
+ODTLineState::isCellAdmissible(int i) const
+{
+  const auto& s = cell(i);
+  if (s.rho <= 0.0) {
+    return false;
+  }
+  if (!hasExpectedSpeciesContainerSize(i)) {
+    return false;
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    if (s.rhoY[static_cast<std::size_t>(n)] < 0.0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 amrex::Real

@@ -261,6 +261,10 @@ ODTStepper::runMVPValidationHook()
     c.rhov = 0.1 * static_cast<amrex::Real>(i);
     c.rhow = -0.2 * static_cast<amrex::Real>(i);
     c.rhoE = 10.0;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      c.rhoY[static_cast<std::size_t>(n)] =
+        c.rho / static_cast<amrex::Real>(NUM_SPECIES);
+    }
     base_state.setCell(i, c);
   }
   base_state.setValid(true);
