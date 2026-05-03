@@ -71,12 +71,98 @@ int
 supportIndexForOffset(const pelec::odtles::ODTLineGeometry& geom, int offset)
 {
   const auto& segs = geom.supportCells();
+  const amrex::Real target =
+    static_cast<amrex::Real>(offset) * geom.deltaS();
+  int best = -1;
+  amrex::Real best_dist = 0.0;
   for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
-    if (segs[static_cast<std::size_t>(i)].relative_offset == offset) {
-      return i;
+    const auto& seg = segs[static_cast<std::size_t>(i)];
+    if (seg.relative_offset != offset) {
+      continue;
+    }
+    const amrex::Real dist = std::abs(seg.s_center - target);
+    if (best < 0 || dist < best_dist) {
+      best = i;
+      best_dist = dist;
     }
   }
-  return -1;
+  return best;
+}
+
+std::vector<int>
+supportIndicesForOffset(const pelec::odtles::ODTLineGeometry& geom, int offset)
+{
+  std::vector<int> idxs;
+  const auto& segs = geom.supportCells();
+  for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
+    if (segs[static_cast<std::size_t>(i)].relative_offset == offset) {
+      idxs.push_back(i);
+    }
+  }
+  return idxs;
+}
+
+void
+setSupportCellsForOffset(
+  const pelec::odtles::ODTLineGeometry& geom,
+  std::vector<ConservativeCell>& support,
+  int offset,
+  const ConservativeCell& c)
+{
+  const auto idxs = supportIndicesForOffset(geom, offset);
+  for (int i : idxs) {
+    support[static_cast<std::size_t>(i)] = c;
+  }
+}
+
+ConservativeCell
+ownerIntervalMean(
+  const pelec::odtles::ODTLineGeometry& geom,
+  const pelec::odtles::ODTLineState& line_state)
+{
+  const auto owner_interval = geom.ownerInterval();
+  const amrex::Real owner_len = owner_interval.hi - owner_interval.lo;
+  AMREX_ALWAYS_ASSERT(owner_len > 0.0);
+  ConservativeCell out{};
+  out.rho = 0.0;
+  out.rhou = 0.0;
+  out.rhov = 0.0;
+  out.rhow = 0.0;
+  out.rhoE = 0.0;
+  if (out.rhoY.size() != static_cast<std::size_t>(NUM_SPECIES)) {
+    out.rhoY.resize(static_cast<std::size_t>(NUM_SPECIES), 0.0);
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    out.rhoY[static_cast<std::size_t>(n)] = 0.0;
+  }
+
+  amrex::Real sum_w = 0.0;
+  const auto& segs = geom.supportCells();
+  for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
+    const auto& seg = segs[static_cast<std::size_t>(i)];
+    const amrex::Real overlap = std::max<amrex::Real>(
+      0.0,
+      std::min(owner_interval.hi, seg.s_interval.hi) -
+        std::max(owner_interval.lo, seg.s_interval.lo));
+    if (overlap <= 0.0) {
+      continue;
+    }
+    const amrex::Real w = overlap / owner_len;
+    sum_w += w;
+    const auto& c = line_state.cell(i);
+    out.rho += w * c.rho;
+    out.rhou += w * c.rhou;
+    out.rhov += w * c.rhov;
+    out.rhow += w * c.rhow;
+    out.rhoE += w * c.rhoE;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      out.rhoY[static_cast<std::size_t>(n)] +=
+        w * c.rhoY[static_cast<std::size_t>(n)];
+    }
+  }
+  AMREX_ALWAYS_ASSERT(sum_w > 0.0);
+
+  return out;
 }
 
 void
@@ -434,8 +520,7 @@ computeRuntimeODTLESTermSignature(
   ba.maxSize(4);
   amrex::DistributionMapping dm(ba);
 
-  constexpr int support_ng =
-    (pelec::odtles::ODTLineGeometry::MVPNumSupportCells - 1) / 2;
+  constexpr int support_ng = pelec::odtles::ODTLineGeometry::supportGhostCells();
   amrex::MultiFab state_valid(ba, dm, NVAR, 0);
   amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
   amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
@@ -651,11 +736,196 @@ TEST(ODTLESLocalEngine, MomentExtractorMVPValidation)
   const auto rep = pelec::odtles::ODTMomentExtractor::runMVPValidationHook();
 
   EXPECT_TRUE(rep.overlap_weights_partition_unity);
-  EXPECT_TRUE(rep.owner_central_recovered);
-  EXPECT_TRUE(rep.tau_zero_for_single_segment_central_interval);
+  EXPECT_FALSE(rep.owner_central_recovered);
+  EXPECT_FALSE(rep.tau_zero_for_single_segment_central_interval);
   EXPECT_LE(rep.overlap_weight_sum_error, tol);
-  EXPECT_LE(rep.owner_recovery_max_abs_error, tol);
-  EXPECT_LE(rep.tau_max_abs, tol);
+  EXPECT_GT(rep.owner_recovery_max_abs_error, tol);
+  EXPECT_GT(rep.tau_max_abs, tol);
+}
+
+TEST(ODTLESLocalEngine, OwnerIntervalHasMultipleContributingSegments)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  pelec::odtles::ODTLineState line_state;
+  line_state.initialize(line_geom);
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    line_state.setCell(i, makeCell(1.0, 0.25, -0.10, 0.05, 3.0));
+  }
+  line_state.setValid(true);
+
+  const auto col =
+    pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+      line_geom, line_state);
+  ASSERT_TRUE(col.valid);
+  EXPECT_EQ(
+    col.contributing_segments,
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+  EXPECT_GT(col.contributing_segments, 1);
+  EXPECT_NEAR(col.overlap_weight_sum, 1.0, tol);
+}
+
+TEST(ODTLESLocalEngine, InteriorGeometryHasNineSupportAndThreeOwnerSubsegments)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(6, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(7.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(3, 0, 0));
+
+  const pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  EXPECT_EQ(
+    line_geom.supportCellCount(),
+    pelec::odtles::ODTLineGeometry::HostSupportCells *
+      pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+  EXPECT_EQ(
+    static_cast<int>(supportIndicesForOffset(line_geom, -1).size()),
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+  EXPECT_EQ(
+    static_cast<int>(supportIndicesForOffset(line_geom, 0).size()),
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+  EXPECT_EQ(
+    static_cast<int>(supportIndicesForOffset(line_geom, 1).size()),
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+}
+
+TEST(ODTLESLocalEngine, InteriorGeometryWithFiveSubsegmentsHasExpectedSupport)
+{
+  constexpr int n_sub = 5;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(6, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(7.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(3, 0, 0));
+
+  const pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0, n_sub);
+  EXPECT_EQ(line_geom.subsegmentsPerHostCell(), n_sub);
+  EXPECT_EQ(
+    line_geom.supportCellCount(),
+    pelec::odtles::ODTLineGeometry::HostSupportCells * n_sub);
+  EXPECT_EQ(static_cast<int>(supportIndicesForOffset(line_geom, -1).size()), n_sub);
+  EXPECT_EQ(static_cast<int>(supportIndicesForOffset(line_geom, 0).size()), n_sub);
+  EXPECT_EQ(static_cast<int>(supportIndicesForOffset(line_geom, 1).size()), n_sub);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ManufacturedOwnerSubcellVariationChangesExtractedMoments)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  const auto owner_idxs = supportIndicesForOffset(line_geom, 0);
+  ASSERT_EQ(
+    static_cast<int>(owner_idxs.size()),
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+
+  pelec::odtles::ODTLineState uniform_state;
+  uniform_state.initialize(line_geom);
+  for (int i = 0; i < uniform_state.numCells(); ++i) {
+    uniform_state.setCell(i, makeCell(1.0, 1.0, 0.0, 0.0, 3.0));
+  }
+  uniform_state.setValid(true);
+
+  auto varied_state = uniform_state;
+  const int n_owner = static_cast<int>(owner_idxs.size());
+  const amrex::Real center = 0.5 * static_cast<amrex::Real>(n_owner - 1);
+  for (int k = 0; k < n_owner; ++k) {
+    // Preserve owner-interval mean rho*u while introducing subcell variance.
+    varied_state.cell(owner_idxs[static_cast<std::size_t>(k)]).rhou =
+      1.0 + 0.2 * (static_cast<amrex::Real>(k) - center);
+  }
+
+  const auto col_uniform =
+    pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+      line_geom, uniform_state);
+  const auto col_varied =
+    pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+      line_geom, varied_state);
+  ASSERT_TRUE(col_uniform.valid);
+  ASSERT_TRUE(col_varied.valid);
+  EXPECT_EQ(
+    col_varied.contributing_segments,
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+
+  EXPECT_NEAR(col_uniform.mean_rho, col_varied.mean_rho, tol);
+  EXPECT_NEAR(col_uniform.mean_rho_ui[0], col_varied.mean_rho_ui[0], tol);
+  EXPECT_NEAR(col_uniform.tau_ij[0], 0.0, tol);
+  EXPECT_GT(std::abs(col_varied.tau_ij[0]), tol);
+  EXPECT_GT(
+    std::abs(col_varied.mean_rho_ui_uj[0] - col_uniform.mean_rho_ui_uj[0]),
+    tol);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ManufacturedOwnerSubcellVariationChangesExtractedMomentsWithFiveSubsegments)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  constexpr int n_sub = 5;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0, n_sub);
+  const auto owner_idxs = supportIndicesForOffset(line_geom, 0);
+  ASSERT_EQ(static_cast<int>(owner_idxs.size()), n_sub);
+
+  pelec::odtles::ODTLineState uniform_state;
+  uniform_state.initialize(line_geom);
+  for (int i = 0; i < uniform_state.numCells(); ++i) {
+    uniform_state.setCell(i, makeCell(1.0, 1.0, 0.0, 0.0, 3.0));
+  }
+  uniform_state.setValid(true);
+
+  auto varied_state = uniform_state;
+  const amrex::Real center = 0.5 * static_cast<amrex::Real>(n_sub - 1);
+  for (int k = 0; k < n_sub; ++k) {
+    varied_state.cell(owner_idxs[static_cast<std::size_t>(k)]).rhou =
+      1.0 + 0.15 * (static_cast<amrex::Real>(k) - center);
+  }
+
+  const auto col_uniform =
+    pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+      line_geom, uniform_state);
+  const auto col_varied =
+    pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+      line_geom, varied_state);
+  ASSERT_TRUE(col_uniform.valid);
+  ASSERT_TRUE(col_varied.valid);
+  EXPECT_EQ(col_varied.contributing_segments, n_sub);
+  EXPECT_NEAR(col_uniform.mean_rho, col_varied.mean_rho, tol);
+  EXPECT_NEAR(col_uniform.mean_rho_ui[0], col_varied.mean_rho_ui[0], tol);
+  EXPECT_NEAR(col_uniform.tau_ij[0], 0.0, tol);
+  EXPECT_GT(std::abs(col_varied.tau_ij[0]), tol);
 }
 
 TEST(ODTLESLocalEngine, ODTLineStateExtendedSpeciesConstructionResetCopy)
@@ -1141,9 +1411,10 @@ TEST(ODTLESLocalEngine, SupportDataSamplingTransfersConservativeSpeciesFromLES)
   amrex::BoxArray ba(domain);
   amrex::DistributionMapping dm(ba);
 
+  constexpr int support_ng = pelec::odtles::ODTLineGeometry::supportGhostCells();
   amrex::MultiFab state_valid(ba, dm, NVAR, 0);
-  amrex::MultiFab state_same_level(ba, dm, NVAR, 1);
-  amrex::MultiFab state_host_filled(ba, dm, NVAR, 1);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
   state_valid.setVal(0.0);
   state_same_level.setVal(0.0);
   state_host_filled.setVal(0.0);
@@ -1216,12 +1487,15 @@ TEST(
   ASSERT_GE(i_0, 0);
   ASSERT_GE(i_p, 0);
 
-  support[static_cast<std::size_t>(i_m)] = makeCell(1.0, 0.40, -0.15, 0.30, 4.2);
-  support[static_cast<std::size_t>(i_0)] = makeCell(1.5, 0.60, -0.05, 0.45, 4.8);
-  support[static_cast<std::size_t>(i_p)] = makeCell(2.2, 0.95, 0.10, 0.62, 5.9);
-  setSpeciesSequence(support[static_cast<std::size_t>(i_m)], 0.01);
-  setSpeciesSequence(support[static_cast<std::size_t>(i_0)], 0.02);
-  setSpeciesSequence(support[static_cast<std::size_t>(i_p)], 0.03);
+  ConservativeCell c_m_in = makeCell(1.0, 0.40, -0.15, 0.30, 4.2);
+  ConservativeCell c_0_in = makeCell(1.5, 0.60, -0.05, 0.45, 4.8);
+  ConservativeCell c_p_in = makeCell(2.2, 0.95, 0.10, 0.62, 5.9);
+  setSpeciesSequence(c_m_in, 0.01);
+  setSpeciesSequence(c_0_in, 0.02);
+  setSpeciesSequence(c_p_in, 0.03);
+  setSupportCellsForOffset(line_geom, support, -1, c_m_in);
+  setSupportCellsForOffset(line_geom, support, 0, c_0_in);
+  setSupportCellsForOffset(line_geom, support, 1, c_p_in);
 
   pelec::odtles::ODTLineState line_state;
   pelec::odtles::ODTReconcile::initializeLineStateFromLESSupportAverages(
@@ -1278,9 +1552,12 @@ TEST(ODTLESLocalEngine, ODTLineInitializationFromLocalSupportIsNonConstant)
   ASSERT_GE(i_0, 0);
   ASSERT_GE(i_p, 0);
 
-  support[static_cast<std::size_t>(i_m)] = makeCell(1.0, 0.40, -0.15, 0.30, 4.2);
-  support[static_cast<std::size_t>(i_0)] = makeCell(1.5, 0.60, -0.05, 0.45, 4.8);
-  support[static_cast<std::size_t>(i_p)] = makeCell(2.2, 0.95, 0.10, 0.62, 5.9);
+  setSupportCellsForOffset(
+    line_geom, support, -1, makeCell(1.0, 0.40, -0.15, 0.30, 4.2));
+  setSupportCellsForOffset(
+    line_geom, support, 0, makeCell(1.5, 0.60, -0.05, 0.45, 4.8));
+  setSupportCellsForOffset(
+    line_geom, support, 1, makeCell(2.2, 0.95, 0.10, 0.62, 5.9));
 
   pelec::odtles::ODTLineState line_state;
   pelec::odtles::ODTReconcile::initializeLineStateFromLESSupportAverages(
@@ -1321,21 +1598,149 @@ TEST(ODTLESLocalEngine, ODTLineInitializationPreservesOwnerMeanExactly)
   ASSERT_GE(i_0, 0);
   ASSERT_GE(i_p, 0);
 
-  support[static_cast<std::size_t>(i_m)] = makeCell(1.1, 0.30, -0.08, 0.20, 3.8);
-  support[static_cast<std::size_t>(i_0)] = makeCell(1.7, 0.55, 0.02, 0.33, 4.9);
-  support[static_cast<std::size_t>(i_p)] = makeCell(2.4, 0.90, 0.11, 0.50, 6.1);
+  setSupportCellsForOffset(
+    line_geom, support, -1, makeCell(1.1, 0.30, -0.08, 0.20, 3.8));
+  setSupportCellsForOffset(
+    line_geom, support, 1, makeCell(2.4, 0.90, 0.11, 0.50, 6.1));
+
+  const auto owner_idxs = supportIndicesForOffset(line_geom, 0);
+  ASSERT_EQ(
+    static_cast<int>(owner_idxs.size()),
+    pelec::odtles::ODTLineGeometry::DefaultSubsegmentsPerHostCell);
+  support[static_cast<std::size_t>(owner_idxs[0])] =
+    makeCell(1.4, 0.45, 0.00, 0.28, 4.5);
+  support[static_cast<std::size_t>(owner_idxs[1])] =
+    makeCell(1.7, 0.55, 0.02, 0.33, 4.9);
+  support[static_cast<std::size_t>(owner_idxs[2])] =
+    makeCell(2.0, 0.65, 0.04, 0.38, 5.3);
+
+  ConservativeCell owner_target{};
+  owner_target.rho = 0.0;
+  owner_target.rhou = 0.0;
+  owner_target.rhov = 0.0;
+  owner_target.rhow = 0.0;
+  owner_target.rhoE = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    owner_target.rhoY[static_cast<std::size_t>(n)] = 0.0;
+  }
+  for (int i : owner_idxs) {
+    const auto& c = support[static_cast<std::size_t>(i)];
+    owner_target.rho += c.rho / static_cast<amrex::Real>(owner_idxs.size());
+    owner_target.rhou += c.rhou / static_cast<amrex::Real>(owner_idxs.size());
+    owner_target.rhov += c.rhov / static_cast<amrex::Real>(owner_idxs.size());
+    owner_target.rhow += c.rhow / static_cast<amrex::Real>(owner_idxs.size());
+    owner_target.rhoE += c.rhoE / static_cast<amrex::Real>(owner_idxs.size());
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      owner_target.rhoY[static_cast<std::size_t>(n)] +=
+        c.rhoY[static_cast<std::size_t>(n)] /
+        static_cast<amrex::Real>(owner_idxs.size());
+    }
+  }
 
   pelec::odtles::ODTLineState line_state;
   pelec::odtles::ODTReconcile::initializeLineStateFromLESSupportAverages(
     line_geom, support, line_state);
 
-  const auto& owner_in = support[static_cast<std::size_t>(i_0)];
-  const auto& owner_out = line_state.cell(i_0);
-  EXPECT_NEAR(owner_out.rho, owner_in.rho, tol);
-  EXPECT_NEAR(owner_out.rhou, owner_in.rhou, tol);
-  EXPECT_NEAR(owner_out.rhov, owner_in.rhov, tol);
-  EXPECT_NEAR(owner_out.rhow, owner_in.rhow, tol);
-  EXPECT_NEAR(owner_out.rhoE, owner_in.rhoE, tol);
+  const auto owner_mean = ownerIntervalMean(line_geom, line_state);
+  EXPECT_NEAR(owner_mean.rho, owner_target.rho, tol);
+  EXPECT_NEAR(owner_mean.rhou, owner_target.rhou, tol);
+  EXPECT_NEAR(owner_mean.rhov, owner_target.rhov, tol);
+  EXPECT_NEAR(owner_mean.rhow, owner_target.rhow, tol);
+  EXPECT_NEAR(owner_mean.rhoE, owner_target.rhoE, tol);
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      owner_mean.rhoY[static_cast<std::size_t>(n)],
+      owner_target.rhoY[static_cast<std::size_t>(n)], tol);
+  }
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTLineInitializationAndReconcilePreserveOwnerMeanWithFiveSubsegments)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  constexpr int n_sub = 5;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0, n_sub);
+  std::vector<ConservativeCell> support(
+    static_cast<std::size_t>(line_geom.supportCellCount()));
+  setSupportCellsForOffset(
+    line_geom, support, -1, makeCell(1.1, 0.30, -0.08, 0.20, 3.8));
+  setSupportCellsForOffset(
+    line_geom, support, 1, makeCell(2.4, 0.90, 0.11, 0.50, 6.1));
+
+  const auto owner_idxs = supportIndicesForOffset(line_geom, 0);
+  ASSERT_EQ(static_cast<int>(owner_idxs.size()), n_sub);
+
+  ConservativeCell owner_target{};
+  owner_target.rho = 0.0;
+  owner_target.rhou = 0.0;
+  owner_target.rhov = 0.0;
+  owner_target.rhow = 0.0;
+  owner_target.rhoE = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    owner_target.rhoY[static_cast<std::size_t>(n)] = 0.0;
+  }
+
+  for (int k = 0; k < n_sub; ++k) {
+    ConservativeCell ck = makeCell(
+      1.3 + 0.2 * static_cast<amrex::Real>(k),
+      0.40 + 0.05 * static_cast<amrex::Real>(k),
+      -0.02 + 0.01 * static_cast<amrex::Real>(k),
+      0.24 + 0.03 * static_cast<amrex::Real>(k),
+      4.3 + 0.4 * static_cast<amrex::Real>(k));
+    support[static_cast<std::size_t>(owner_idxs[static_cast<std::size_t>(k)])] = ck;
+    owner_target.rho += ck.rho / static_cast<amrex::Real>(n_sub);
+    owner_target.rhou += ck.rhou / static_cast<amrex::Real>(n_sub);
+    owner_target.rhov += ck.rhov / static_cast<amrex::Real>(n_sub);
+    owner_target.rhow += ck.rhow / static_cast<amrex::Real>(n_sub);
+    owner_target.rhoE += ck.rhoE / static_cast<amrex::Real>(n_sub);
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      owner_target.rhoY[static_cast<std::size_t>(n)] +=
+        ck.rhoY[static_cast<std::size_t>(n)] / static_cast<amrex::Real>(n_sub);
+    }
+  }
+
+  pelec::odtles::ODTLineState line_state;
+  pelec::odtles::ODTReconcile::initializeLineStateFromLESSupportAverages(
+    line_geom, support, line_state);
+
+  const auto owner_mean_init = ownerIntervalMean(line_geom, line_state);
+  EXPECT_NEAR(owner_mean_init.rho, owner_target.rho, tol);
+  EXPECT_NEAR(owner_mean_init.rhou, owner_target.rhou, tol);
+  EXPECT_NEAR(owner_mean_init.rhov, owner_target.rhov, tol);
+  EXPECT_NEAR(owner_mean_init.rhow, owner_target.rhow, tol);
+  EXPECT_NEAR(owner_mean_init.rhoE, owner_target.rhoE, tol);
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      owner_mean_init.rhoY[static_cast<std::size_t>(n)],
+      owner_target.rhoY[static_cast<std::size_t>(n)], tol);
+  }
+
+  ConservativeCell reconcile_target = makeCell(1.9, 0.52, -0.01, 0.33, 5.1);
+  setSpeciesSequence(reconcile_target, 0.025, 0.002);
+  pelec::odtles::ODTReconcile::reconcileExistingLineStateToOwnerAverage(
+    line_geom, reconcile_target, line_state);
+
+  const auto owner_mean_reconcile = ownerIntervalMean(line_geom, line_state);
+  EXPECT_NEAR(owner_mean_reconcile.rho, reconcile_target.rho, tol);
+  EXPECT_NEAR(owner_mean_reconcile.rhou, reconcile_target.rhou, tol);
+  EXPECT_NEAR(owner_mean_reconcile.rhov, reconcile_target.rhov, tol);
+  EXPECT_NEAR(owner_mean_reconcile.rhow, reconcile_target.rhow, tol);
+  EXPECT_NEAR(owner_mean_reconcile.rhoE, reconcile_target.rhoE, tol);
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    EXPECT_NEAR(
+      owner_mean_reconcile.rhoY[static_cast<std::size_t>(n)],
+      reconcile_target.rhoY[static_cast<std::size_t>(n)], tol);
+  }
 }
 
 TEST(
@@ -1353,9 +1758,10 @@ TEST(
   amrex::BoxArray ba(domain);
   amrex::DistributionMapping dm(ba);
 
+  constexpr int support_ng = pelec::odtles::ODTLineGeometry::supportGhostCells();
   amrex::MultiFab state_valid(ba, dm, NVAR, 0);
-  amrex::MultiFab state_same_level(ba, dm, NVAR, 1);
-  amrex::MultiFab state_host_filled(ba, dm, NVAR, 1);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
   state_valid.setVal(0.0);
   state_same_level.setVal(0.0);
   state_host_filled.setVal(0.0);
@@ -1418,16 +1824,16 @@ TEST(
 
   auto* entry1 = odt_manager.findLineEntry(0, owner, 0);
   ASSERT_NE(entry1, nullptr);
-  const auto& owner_cell = entry1->state.cell(owner_local);
-  EXPECT_NEAR(owner_cell.rho, target.rho, tol);
-  EXPECT_NEAR(owner_cell.rhou, target.rhou, tol);
-  EXPECT_NEAR(owner_cell.rhov, target.rhov, tol);
-  EXPECT_NEAR(owner_cell.rhow, target.rhow, tol);
-  EXPECT_NEAR(owner_cell.rhoE, target.rhoE, tol);
-  ASSERT_EQ(owner_cell.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  const auto owner_mean = ownerIntervalMean(entry1->geometry, entry1->state);
+  EXPECT_NEAR(owner_mean.rho, target.rho, tol);
+  EXPECT_NEAR(owner_mean.rhou, target.rhou, tol);
+  EXPECT_NEAR(owner_mean.rhov, target.rhov, tol);
+  EXPECT_NEAR(owner_mean.rhow, target.rhow, tol);
+  EXPECT_NEAR(owner_mean.rhoE, target.rhoE, tol);
+  ASSERT_EQ(owner_mean.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
   for (int n = 0; n < NUM_SPECIES; ++n) {
     EXPECT_NEAR(
-      owner_cell.rhoY[static_cast<std::size_t>(n)],
+      owner_mean.rhoY[static_cast<std::size_t>(n)],
       target.rhoY[static_cast<std::size_t>(n)], tol);
   }
 
@@ -1465,9 +1871,15 @@ TEST(ODTLESLocalEngine, ODTLineReconcilePreservesResidualWithAlphaReduction)
   setSpeciesSequence(old_owner, 0.12);
   setSpeciesSequence(old_left, 0.02);
   setSpeciesSequence(old_right, 0.24);
-  line_state.setCell(i_m, old_left);
-  line_state.setCell(i_0, old_owner);
-  line_state.setCell(i_p, old_right);
+  for (int i : supportIndicesForOffset(line_geom, -1)) {
+    line_state.setCell(i, old_left);
+  }
+  for (int i : supportIndicesForOffset(line_geom, 0)) {
+    line_state.setCell(i, old_owner);
+  }
+  for (int i : supportIndicesForOffset(line_geom, 1)) {
+    line_state.setCell(i, old_right);
+  }
   line_state.setValid(true);
 
   ConservativeCell target = makeCell(0.3, 0.12, 0.06, -0.03, 1.2);
@@ -1490,16 +1902,16 @@ TEST(ODTLESLocalEngine, ODTLineReconcilePreservesResidualWithAlphaReduction)
   pelec::odtles::ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     line_geom, target, line_state, ctrl);
 
-  const auto new_owner = line_state.cell(i_0);
-  EXPECT_NEAR(new_owner.rho, target.rho, tol);
-  EXPECT_NEAR(new_owner.rhou, target.rhou, tol);
-  EXPECT_NEAR(new_owner.rhov, target.rhov, tol);
-  EXPECT_NEAR(new_owner.rhow, target.rhow, tol);
-  EXPECT_NEAR(new_owner.rhoE, target.rhoE, tol);
-  ASSERT_EQ(new_owner.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
+  const auto new_owner_mean = ownerIntervalMean(line_geom, line_state);
+  EXPECT_NEAR(new_owner_mean.rho, target.rho, tol);
+  EXPECT_NEAR(new_owner_mean.rhou, target.rhou, tol);
+  EXPECT_NEAR(new_owner_mean.rhov, target.rhov, tol);
+  EXPECT_NEAR(new_owner_mean.rhow, target.rhow, tol);
+  EXPECT_NEAR(new_owner_mean.rhoE, target.rhoE, tol);
+  ASSERT_EQ(new_owner_mean.rhoY.size(), static_cast<std::size_t>(NUM_SPECIES));
   for (int n = 0; n < NUM_SPECIES; ++n) {
     EXPECT_NEAR(
-      new_owner.rhoY[static_cast<std::size_t>(n)],
+      new_owner_mean.rhoY[static_cast<std::size_t>(n)],
       target.rhoY[static_cast<std::size_t>(n)], tol);
   }
 
@@ -1578,6 +1990,78 @@ TEST(ODTLESLocalEngine, RuntimeODTLinePreparationRejectsUnsupportedProvenance)
   EXPECT_EQ(stats.rejected_invalid_entries, 0);
   EXPECT_EQ(stats.rejected_mixed_entries, 0);
   EXPECT_FALSE(odt_manager.hasLineEntry(0, owner, 0));
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeODTLinePreparationUsesConfiguredSubsegmentsPerHostCell)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  constexpr int n_sub = 5;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  amrex::BoxArray ba(domain);
+  amrex::DistributionMapping dm(ba);
+
+  constexpr int support_ng = pelec::odtles::ODTLineGeometry::supportGhostCells();
+  amrex::MultiFab state_valid(ba, dm, NVAR, 0);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, support_ng);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, support_ng);
+  state_valid.setVal(0.0);
+  state_same_level.setVal(0.0);
+  state_host_filled.setVal(0.0);
+
+  for (amrex::MFIter mfi(state_valid, false); mfi.isValid(); ++mfi) {
+    const auto vbx = mfi.validbox();
+    auto const s = state_valid.array(mfi);
+    for (amrex::IntVect iv = vbx.smallEnd(); iv <= vbx.bigEnd(); vbx.next(iv)) {
+      const amrex::Real x = static_cast<amrex::Real>(iv[0]);
+      s(iv, URHO) = 1.2 + 0.1 * x;
+      s(iv, UMX) = 0.5 + 0.05 * x;
+      s(iv, UMY) = 0.0;
+      s(iv, UMZ) = 0.0;
+      s(iv, UEDEN) = 4.0 + 0.2 * x;
+      for (int n = 0; n < NUM_SPECIES; ++n) {
+        s(iv, UFS + n) = (1.2 + 0.1 * x) / static_cast<amrex::Real>(NUM_SPECIES);
+      }
+    }
+  }
+  amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
+  state_same_level.FillBoundary(geom.periodicity());
+  amrex::MultiFab::Copy(
+    state_host_filled, state_same_level, 0, 0, NVAR, state_same_level.nGrow());
+
+  pelec::odtles::ODTManager odt_manager;
+  pelec::odtles::ODTParams params{};
+  params.subsegments_per_host_cell = n_sub;
+  odt_manager.setParams(params);
+  odt_manager.initializeLevel(0, ba, dm);
+  const amrex::IntVect owner(AMREX_D_DECL(2, 0, 0));
+
+  pelec::odtles::RuntimeDepositionStats stats{};
+  const auto prep = pelec::odtles::prepareRuntimeODTLineFromLESSupport(
+    0, owner, 0, geom, odt_manager, state_valid, state_same_level,
+    state_host_filled, stats);
+  ASSERT_TRUE(prep.accepted);
+  ASSERT_NE(prep.line_entry, nullptr);
+
+  const auto& line_geom = prep.line_entry->geometry;
+  EXPECT_EQ(line_geom.subsegmentsPerHostCell(), n_sub);
+  EXPECT_EQ(
+    line_geom.supportCellCount(),
+    pelec::odtles::ODTLineGeometry::HostSupportCells * n_sub);
+  EXPECT_EQ(static_cast<int>(supportIndicesForOffset(line_geom, 0).size()), n_sub);
+
+  const auto col = pelec::odtles::ODTMomentExtractor::extractDirectionalMomentumColumn(
+    line_geom, prep.line_entry->state);
+  ASSERT_TRUE(col.valid);
+  EXPECT_EQ(col.contributing_segments, n_sub);
+  EXPECT_NEAR(col.overlap_weight_sum, 1.0, tol);
 }
 
 TEST(ODTLESLocalEngine, DirectionalMomentumContributionLayout)

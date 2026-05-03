@@ -65,6 +65,7 @@ static amrex::Real Cw;
 static amrex::Real CI;
 static amrex::Real PrT;
 static int odt_max_local_substeps;
+static int odt_subsegments_per_host_cell;
 static amrex::Real eb_boundary_T;
 static bool eb_isothermal;
 static bool eb_noslip;

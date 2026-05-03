@@ -58,6 +58,117 @@ collectIndicesByOffsetSign(const ODTLineGeometry& geom, int sign)
   return idxs;
 }
 
+std::vector<amrex::Real>
+componentArrayFromCell(const ODTLineState::ConservativeCell& c);
+
+amrex::Real
+overlapLength(
+  const ODTLineGeometry::Interval& a,
+  const ODTLineGeometry::Interval& b)
+{
+  return std::max<amrex::Real>(
+    0.0, std::min(a.hi, b.hi) - std::max(a.lo, b.lo));
+}
+
+std::vector<amrex::Real>
+ownerIntervalOverlapWeights(const ODTLineGeometry& geom)
+{
+  const auto owner_interval = geom.ownerInterval();
+  const amrex::Real owner_len = owner_interval.hi - owner_interval.lo;
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    owner_len > 0.0, "ODTReconcile owner interval length must be positive");
+
+  std::vector<amrex::Real> w(
+    static_cast<std::size_t>(geom.supportCellCount()), 0.0);
+  amrex::Real sum_w = 0.0;
+  const auto& segs = geom.supportCells();
+  for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
+    const amrex::Real overlap = overlapLength(owner_interval, segs[static_cast<std::size_t>(i)].s_interval);
+    if (overlap <= 0.0) {
+      continue;
+    }
+    const amrex::Real wi = overlap / owner_len;
+    w[static_cast<std::size_t>(i)] = wi;
+    sum_w += wi;
+  }
+
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    sum_w > 0.0, "ODTReconcile owner overlap weights must have positive sum");
+  const amrex::Real tol = 1.0e-12;
+  if (std::abs(sum_w - 1.0) > tol) {
+    const amrex::Real inv = 1.0 / sum_w;
+    for (auto& wi : w) {
+      wi *= inv;
+    }
+  }
+  return w;
+}
+
+std::vector<amrex::Real>
+weightedMeanFromSupportValues(
+  const std::vector<ODTLineState::ConservativeCell>& support_values,
+  const std::vector<amrex::Real>& weights)
+{
+  constexpr int hydro_components = 5;
+  const int ncomp = hydro_components + NUM_SPECIES;
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    support_values.size() == weights.size(),
+    "ODTReconcile weighted mean requires equal support/value sizes");
+
+  std::vector<amrex::Real> q(static_cast<std::size_t>(ncomp), 0.0);
+  amrex::Real sum_w = 0.0;
+  for (int i = 0; i < static_cast<int>(support_values.size()); ++i) {
+    const amrex::Real wi = weights[static_cast<std::size_t>(i)];
+    if (wi <= 0.0) {
+      continue;
+    }
+    sum_w += wi;
+    const auto qi =
+      componentArrayFromCell(support_values[static_cast<std::size_t>(i)]);
+    for (int n = 0; n < ncomp; ++n) {
+      q[static_cast<std::size_t>(n)] += wi * qi[static_cast<std::size_t>(n)];
+    }
+  }
+
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    sum_w > 0.0, "ODTReconcile weighted mean found no weighted contributors");
+  return q;
+}
+
+std::vector<amrex::Real>
+offsetMeanFromSupportValues(
+  const ODTLineGeometry& geom,
+  const std::vector<ODTLineState::ConservativeCell>& support_values,
+  int offset,
+  const std::vector<amrex::Real>& fallback)
+{
+  constexpr int hydro_components = 5;
+  const int ncomp = hydro_components + NUM_SPECIES;
+  std::vector<amrex::Real> q(static_cast<std::size_t>(ncomp), 0.0);
+  int count = 0;
+  const auto& segs = geom.supportCells();
+  for (int i = 0; i < static_cast<int>(segs.size()); ++i) {
+    if (segs[static_cast<std::size_t>(i)].relative_offset != offset) {
+      continue;
+    }
+    const auto qi =
+      componentArrayFromCell(support_values[static_cast<std::size_t>(i)]);
+    for (int n = 0; n < ncomp; ++n) {
+      q[static_cast<std::size_t>(n)] += qi[static_cast<std::size_t>(n)];
+    }
+    ++count;
+  }
+
+  if (count <= 0) {
+    return fallback;
+  }
+  const amrex::Real inv = 1.0 / static_cast<amrex::Real>(count);
+  for (int n = 0; n < ncomp; ++n) {
+    q[static_cast<std::size_t>(n)] *= inv;
+  }
+  return q;
+}
+
 amrex::Real
 computeLimitedSlope(
   amrex::Real ql,
@@ -230,21 +341,18 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
     "ODTReconcile initialize requires at least one neighbor around owner");
 
   const amrex::Real dx = geom.deltaS();
-  const auto owner_avg =
-    local_support_cell_averages[static_cast<std::size_t>(owner)];
   constexpr int hydro_components = 5;
   const int ncomp = 5 + NUM_SPECIES;
-  auto q0 = componentArrayFromCell(owner_avg);
+  const auto owner_w = ownerIntervalOverlapWeights(geom);
+  auto q0 = weightedMeanFromSupportValues(local_support_cell_averages, owner_w);
 
   std::vector<amrex::Real> ql = q0;
   std::vector<amrex::Real> qr = q0;
   if (neg_idx >= 0) {
-    ql = componentArrayFromCell(
-      local_support_cell_averages[static_cast<std::size_t>(neg_idx)]);
+    ql = offsetMeanFromSupportValues(geom, local_support_cell_averages, -1, q0);
   }
   if (pos_idx >= 0) {
-    qr = componentArrayFromCell(
-      local_support_cell_averages[static_cast<std::size_t>(pos_idx)]);
+    qr = offsetMeanFromSupportValues(geom, local_support_cell_averages, 1, q0);
   }
 
   std::vector<amrex::Real> slopes(static_cast<std::size_t>(ncomp), 0.0);
@@ -318,11 +426,20 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
 
     std::vector<amrex::Real> qrec(static_cast<std::size_t>(ncomp), 0.0);
     for (int n = 0; n < ncomp; ++n) {
-      qrec[n] = q0[n] + slopes[n] * s_center;
-      qrec[n] = std::clamp(qrec[n], qmin[n], qmax[n]);
-      if (n >= hydro_components) {
-        // Keep conservative species non-negative on the embedded line.
-        qrec[n] = std::max<amrex::Real>(qrec[n], 0.0);
+      if (owner_w[static_cast<std::size_t>(i)] > 0.0) {
+        // Keep owner-interval mean exactly equal to LES owner conservative
+        // target by setting all owner-overlap subsegments to the same target.
+        qrec[n] = std::clamp(q0[n], qmin[n], qmax[n]);
+        if (n >= hydro_components) {
+          qrec[n] = std::max<amrex::Real>(qrec[n], 0.0);
+        }
+      } else {
+        qrec[n] = q0[n] + slopes[n] * s_center;
+        qrec[n] = std::clamp(qrec[n], qmin[n], qmax[n]);
+        if (n >= hydro_components) {
+          // Keep conservative species non-negative on the embedded line.
+          qrec[n] = std::max<amrex::Real>(qrec[n], 0.0);
+        }
       }
     }
 
@@ -331,8 +448,9 @@ ODTReconcile::initializeLineStateFromLESSupportAverages(
     line_state.setCell(i, cell);
   }
 
-  // Owner interval is centered at s=0, so linear reconstruction preserves the
-  // owner LES average exactly over the owner segment.
+  // Explicit owner-interval target treatment: all owner-overlap subsegments
+  // are set to the owner conservative target to preserve owner-interval means
+  // exactly.
   line_state.setValid(true);
 }
 
@@ -382,7 +500,13 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     isAdmissible(q_target, ctrl),
     "ODTReconcile reconcile target owner LES mean is not admissible");
 
-  const auto q_owner_old = componentArrayFromCell(line_state.cell(owner));
+  const auto owner_w = ownerIntervalOverlapWeights(geom);
+  std::vector<ConservativeCell> old_cells(
+    static_cast<std::size_t>(line_state.numCells()));
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    old_cells[static_cast<std::size_t>(i)] = line_state.cell(i);
+  }
+  const auto q_owner_old = weightedMeanFromSupportValues(old_cells, owner_w);
 
   // Residual relative to old owner mean at each support cell.
   std::vector<std::vector<amrex::Real>> residuals(
@@ -396,11 +520,30 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     }
   }
 
+  std::vector<amrex::Real> owner_residual_mean(static_cast<std::size_t>(ncomp), 0.0);
+  for (int i = 0; i < line_state.numCells(); ++i) {
+    const amrex::Real wi = owner_w[static_cast<std::size_t>(i)];
+    if (wi <= 0.0) {
+      continue;
+    }
+    const auto& ri = residuals[static_cast<std::size_t>(i)];
+    for (int n = 0; n < ncomp; ++n) {
+      owner_residual_mean[static_cast<std::size_t>(n)] +=
+        wi * ri[static_cast<std::size_t>(n)];
+    }
+  }
+
   auto make_trial = [&](int i, amrex::Real alpha) -> std::vector<amrex::Real> {
     std::vector<amrex::Real> q(static_cast<std::size_t>(ncomp), 0.0);
     const auto& r = residuals[static_cast<std::size_t>(i)];
+    const amrex::Real wi = owner_w[static_cast<std::size_t>(i)];
     for (int n = 0; n < ncomp; ++n) {
-      q[n] = q_target[n] + alpha * r[n];
+      const amrex::Real centered_r =
+        (wi > 0.0)
+          ? (r[static_cast<std::size_t>(n)] -
+             owner_residual_mean[static_cast<std::size_t>(n)])
+          : r[static_cast<std::size_t>(n)];
+      q[n] = q_target[n] + alpha * centered_r;
     }
     return q;
   };
@@ -447,10 +590,8 @@ ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     line_state.setCell(i, c);
   }
 
-  // Explicit mean treatment: enforce owner exactly after positivity control.
-  ODTLineState::ConservativeCell owner_cell{};
-  setCellFromComponentArray(owner_cell, q_target);
-  line_state.setCell(owner, owner_cell);
+  // Owner-overlap residual centering in make_trial preserves owner-interval
+  // conservative means exactly at every accepted alpha.
 }
 
 } // namespace pelec::odtles

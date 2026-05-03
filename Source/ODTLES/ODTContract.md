@@ -71,8 +71,9 @@ The embedded ODT contract is anchored to these host files and locations:
     `d(rho*u_i)/dt = d/ds(mu * d(u_i)/ds)`, `u_i=(rho*u_i)/rho`.
 - User-facing toggles for enabling/disabling or selecting alternate molecular
   momentum forms are deprecated and ignored in production runtime.
-- The only runtime ODT local-step control retained is:
+- Runtime ODT local controls retained are:
   - `pelec.odt_max_local_substeps`
+  - `pelec.odt_subsegments_per_host_cell` (odd integer, `>= 3`)
 - Thermochemical recovery remains a local admissibility/EOS bridge only;
   persistent ODT line storage remains conservative (`rho`, momentum, `rhoE`,
   `rhoY_k`) with no persistent temperature variable.
@@ -82,6 +83,7 @@ Minimal input example:
 pelec.do_les = 1
 pelec.les_model = 4
 pelec.odt_max_local_substeps = 1
+pelec.odt_subsegments_per_host_cell = 3
 ```
 
 ## Explicit exclusions for this contract

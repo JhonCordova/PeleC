@@ -13,7 +13,12 @@ namespace pelec::odtles
 class ODTLineGeometry
 {
 public:
-  static constexpr int MVPNumSupportCells = 3;
+  static constexpr int HostSupportCells = 3;
+  static constexpr int DefaultSubsegmentsPerHostCell = 3;
+  static constexpr int supportGhostCells() noexcept
+  {
+    return (HostSupportCells - 1) / 2;
+  }
 
   struct OwnershipKey
   {
@@ -54,13 +59,15 @@ public:
     const amrex::Geometry& geom,
     int level,
     const amrex::IntVect& owner_cell,
-    int dir);
+    int dir,
+    int subsegments_per_host_cell = DefaultSubsegmentsPerHostCell);
 
   void define(
     const amrex::Geometry& geom,
     int level,
     const amrex::IntVect& owner_cell,
-    int dir);
+    int dir,
+    int subsegments_per_host_cell = DefaultSubsegmentsPerHostCell);
 
   bool isDefined() const noexcept { return m_defined; }
 
@@ -71,6 +78,7 @@ public:
 
   amrex::Real deltaS() const noexcept { return m_delta_s; }
   amrex::Real ownerCenterPhysical() const noexcept { return m_owner_center_phys; }
+  int subsegmentsPerHostCell() const noexcept { return m_subsegments_per_host_cell; }
 
   int supportCellCount() const noexcept
   {
@@ -99,6 +107,7 @@ private:
   Interval m_support_interval{};
   Interval m_owner_interval{};
   int m_owner_local_ordinal = -1;
+  int m_subsegments_per_host_cell = DefaultSubsegmentsPerHostCell;
   std::vector<CellSegment> m_support_cells;
   BoundaryMetadata m_boundary{};
 };

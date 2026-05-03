@@ -219,6 +219,10 @@ PrT                          Real          1.0
 # host-owned dt_LES.
 odt_max_local_substeps       int           1
 
+# ODTLES local runtime: number of ODT subsegments per host LES support cell.
+# Must be odd and >= 3.
+odt_subsegments_per_host_cell int          3
+
 # Runtime ODT line molecular momentum diffusion now always uses:
 # - thermochemical recovery + host molecular viscosity
 # - velocity-gradient viscous-flux form

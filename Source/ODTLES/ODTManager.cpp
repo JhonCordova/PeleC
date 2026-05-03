@@ -1,5 +1,8 @@
 #include "ODTManager.H"
 
+#include <algorithm>
+#include <cmath>
+
 #include <AMReX.H>
 
 #include "IndexDefines.H"
@@ -55,21 +58,77 @@ ODTManager::SupportData::conservativeAveragesOrdered() const
 ODTManager::ConservativeCell
 ODTManager::SupportData::ownerAverage(const ODTLineGeometry& geom) const
 {
-  const int owner = geom.ownerLocalOrdinal();
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    owner >= 0, "SupportData owner ordinal is invalid");
+    static_cast<int>(ordered_samples.size()) == geom.supportCellCount(),
+    "SupportData owner average requires sample/geometry support-size consistency");
+
+  const auto owner_interval = geom.ownerInterval();
+  const amrex::Real owner_len = owner_interval.hi - owner_interval.lo;
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    owner < static_cast<int>(ordered_samples.size()),
-    "SupportData owner ordinal out of range");
-  const auto& s = ordered_samples[static_cast<std::size_t>(owner)];
+    owner_len > 0.0, "SupportData owner interval length must be positive");
+
+  ConservativeCell out{};
+  amrex::Real sum_w = 0.0;
+  const auto& support = geom.supportCells();
+  for (int i = 0; i < static_cast<int>(ordered_samples.size()); ++i) {
+    const auto& s = ordered_samples[static_cast<std::size_t>(i)];
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      s.has_value, "SupportData owner average requires populated support values");
+
+    const auto& seg = support[static_cast<std::size_t>(i)];
+    const amrex::Real overlap = std::max<amrex::Real>(
+      0.0,
+      std::min(owner_interval.hi, seg.s_interval.hi) -
+        std::max(owner_interval.lo, seg.s_interval.lo));
+    if (overlap <= 0.0) {
+      continue;
+    }
+
+    const amrex::Real w = overlap / owner_len;
+    sum_w += w;
+
+    out.rho += w * s.value.rho;
+    out.rhou += w * s.value.rhou;
+    out.rhov += w * s.value.rhov;
+    out.rhow += w * s.value.rhow;
+    out.rhoE += w * s.value.rhoE;
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      s.value.rhoY.size() == static_cast<std::size_t>(NUM_SPECIES),
+      "SupportData owner average expected rhoY size to match NUM_SPECIES");
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      out.rhoY[static_cast<std::size_t>(n)] +=
+        w * s.value.rhoY[static_cast<std::size_t>(n)];
+    }
+  }
+
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    s.has_value, "SupportData owner sample has no value");
-  return s.value;
+    sum_w > 0.0, "SupportData owner average found no owner-interval overlap");
+
+  const amrex::Real tol = 1.0e-12;
+  if (std::abs(sum_w - 1.0) > tol) {
+    const amrex::Real inv_w = 1.0 / sum_w;
+    out.rho *= inv_w;
+    out.rhou *= inv_w;
+    out.rhov *= inv_w;
+    out.rhow *= inv_w;
+    out.rhoE *= inv_w;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      out.rhoY[static_cast<std::size_t>(n)] *= inv_w;
+    }
+  }
+
+  return out;
 }
 
 void
 ODTManager::setParams(const ODTParams& params)
 {
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    params.subsegments_per_host_cell >= 3,
+    "ODTManager::setParams requires subsegments_per_host_cell >= 3");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    (params.subsegments_per_host_cell % 2) == 1,
+    "ODTManager::setParams requires odd subsegments_per_host_cell");
   m_params = params;
 }
 
@@ -144,7 +203,8 @@ ODTManager::getOrCreateLineEntry(
   auto it_inserted_pair = m_line_entries.emplace(key, LineEntry{});
   auto it = it_inserted_pair.first;
   if (it_inserted_pair.second) {
-    it->second.geometry.define(geom, level, owner_cell, dir);
+    it->second.geometry.define(
+      geom, level, owner_cell, dir, m_params.subsegments_per_host_cell);
     it->second.state.initialize(it->second.geometry);
   } else {
     AMREX_ALWAYS_ASSERT(it->second.geometry.isDefined());
@@ -364,7 +424,18 @@ ODTManager::reconcileLineStateToLESState(
   AMREX_ALWAYS_ASSERT(entry->geometry.ownerCell() == owner_cell);
   AMREX_ALWAYS_ASSERT(entry->geometry.dir() == dir);
 
-  const auto owner_avg = getConservativeCellAverageAt(owner_cell, geom, state);
+  const auto local_support_cell_averages =
+    assembleLocalSupportCellAverages(entry->geometry, geom, state);
+  SupportData support_data{};
+  support_data.ordered_samples.resize(local_support_cell_averages.size());
+  for (int i = 0; i < static_cast<int>(local_support_cell_averages.size()); ++i) {
+    auto& sample = support_data.ordered_samples[static_cast<std::size_t>(i)];
+    sample.support_ordinal = i;
+    sample.value = local_support_cell_averages[static_cast<std::size_t>(i)];
+    sample.has_value = true;
+    sample.provenance = SupportProvenance::SameLevelValidCell;
+  }
+  const auto owner_avg = support_data.ownerAverage(entry->geometry);
   ODTReconcile::reconcileExistingLineStateToOwnerAverage(
     entry->geometry, owner_avg, entry->state);
   return entry->state;

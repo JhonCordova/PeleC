@@ -169,6 +169,7 @@ PeleC::getODTLESTerm(
   pelec::odtles::ODTParams odt_runtime_params = odt_manager.params();
   odt_runtime_params.enabled = true;
   odt_runtime_params.max_local_substeps = odt_max_local_substeps;
+  odt_runtime_params.subsegments_per_host_cell = odt_subsegments_per_host_cell;
   odt_manager.setParams(odt_runtime_params);
 
   // ODT runtime hookup:
@@ -176,8 +177,7 @@ PeleC::getODTLESTerm(
   // 2) advance each line over host-owned dt_LES,
   // 3) extract directional SGS momentum moments and map to directional face
   //    fluxes, then use standard PeleC conservative divergence assembly.
-  constexpr int support_ng =
-    (pelec::odtles::ODTLineGeometry::MVPNumSupportCells - 1) / 2;
+  constexpr int support_ng = pelec::odtles::ODTLineGeometry::supportGhostCells();
 
   amrex::MultiFab state_valid(grids, dmap, NVAR, 0, amrex::MFInfo(), Factory());
   FillPatch(*this, state_valid, 0, time, State_Type, 0, NVAR);
@@ -327,7 +327,9 @@ prepareRuntimeODTLineFromLESSupport(
 {
   ODTLinePreparationResult out{};
 
-  ODTLineGeometry line_geom(geom, level, owner_cell, dir);
+  ODTLineGeometry line_geom(
+    geom, level, owner_cell, dir,
+    odt_manager.params().subsegments_per_host_cell);
   const auto support_data = odt_manager.collectSupportData(
     line_geom, geom, state_valid, state_same_level, state_host_filled);
 
