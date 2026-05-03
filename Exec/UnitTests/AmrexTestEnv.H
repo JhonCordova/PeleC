@@ -28,7 +28,8 @@ public:
 
   void SetUp() override
   {
-    amrex::Initialize(m_argc, m_argv, true, MPI_COMM_WORLD, []() {
+    amrex::Initialize(
+      m_argc, m_argv, true, amrex::ParallelDescriptor::Communicator(), []() {
       amrex::ParmParse pp("amrex");
       if (!(pp.contains("v") || pp.contains("verbose"))) {
         pp.add("verbose", -1);

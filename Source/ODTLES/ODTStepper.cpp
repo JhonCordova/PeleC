@@ -260,7 +260,12 @@ ODTStepper::runMVPValidationHook()
     c.rhou = static_cast<amrex::Real>(i + 1);
     c.rhov = 0.1 * static_cast<amrex::Real>(i);
     c.rhow = -0.2 * static_cast<amrex::Real>(i);
-    c.rhoE = 10.0;
+    // Keep manufactured conservative state thermochemically admissible for
+    // the production diffusion path (thermochemical recovery + molecular mu).
+    const amrex::Real kinetic =
+      0.5 * (c.rhou * c.rhou + c.rhov * c.rhov + c.rhow * c.rhow) / c.rho;
+    const amrex::Real eint = 5.0;
+    c.rhoE = c.rho * eint + kinetic;
     for (int n = 0; n < NUM_SPECIES; ++n) {
       c.rhoY[static_cast<std::size_t>(n)] =
         c.rho / static_cast<amrex::Real>(NUM_SPECIES);
