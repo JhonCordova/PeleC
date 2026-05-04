@@ -502,6 +502,10 @@ struct RuntimeSignature
   amrex::Real l1_others = 0.0;
   long stepped_entries = 0;
   long moment_columns_built = 0;
+  long stepper_attempted_events = 0;
+  long stepper_applied_events = 0;
+  long stepper_rejected_events = 0;
+  long stepper_diffusion_only_catchup = 0;
 };
 
 RuntimeSignature
@@ -634,6 +638,10 @@ computeRuntimeODTLESTermSignature(
   amrex::ParallelDescriptor::ReduceRealSum(sig.l1_others);
   sig.stepped_entries = stats.stepped_entries;
   sig.moment_columns_built = stats.moment_columns_built;
+  sig.stepper_attempted_events = stats.stepper_attempted_events;
+  sig.stepper_applied_events = stats.stepper_applied_events;
+  sig.stepper_rejected_events = stats.stepper_rejected_events;
+  sig.stepper_diffusion_only_catchup = stats.stepper_diffusion_only_catchup;
   return sig;
 }
 
@@ -1278,6 +1286,7 @@ TEST(
   pelec::odtles::configureRuntimeODTStepperControls(params, step_ctrl);
 
   EXPECT_EQ(step_ctrl.max_internal_iterations, 1);
+  EXPECT_DOUBLE_EQ(step_ctrl.sampler_controls.event_rate, 0.0);
   EXPECT_TRUE(step_ctrl.diffusion_controls.use_molecular_viscosity_for_momentum);
   EXPECT_EQ(
     step_ctrl.diffusion_controls.momentum_molecular_form,
@@ -1289,15 +1298,17 @@ TEST(
 
 TEST(
   ODTLESLocalEngine,
-  RuntimeStepperControlPlumbingOnlyExposesSubstepCountTuning)
+  RuntimeStepperControlPlumbingExposesSubstepAndEventRateTuning)
 {
   pelec::odtles::ODTParams params{};
   params.max_local_substeps = 7;
+  params.event_rate = 123.5;
 
   pelec::odtles::ODTStepper::Controls step_ctrl{};
   pelec::odtles::configureRuntimeODTStepperControls(params, step_ctrl);
 
   EXPECT_EQ(step_ctrl.max_internal_iterations, 7);
+  EXPECT_DOUBLE_EQ(step_ctrl.sampler_controls.event_rate, 123.5);
   EXPECT_TRUE(step_ctrl.diffusion_controls.use_molecular_viscosity_for_momentum);
   EXPECT_EQ(
     step_ctrl.diffusion_controls.momentum_molecular_form,
@@ -2269,6 +2280,50 @@ TEST(
   EXPECT_NEAR(sig_default.l1_umz, sig_explicit.l1_umz, tol);
   EXPECT_NEAR(sig_default.l1_ueden, sig_explicit.l1_ueden, tol);
   EXPECT_NEAR(sig_default.l1_others, sig_explicit.l1_others, tol);
+}
+
+TEST(ODTLESLocalEngine, RuntimeODTEventRateZeroKeepsDiffusionOnlyStepperCounters)
+{
+  pelec::odtles::ODTParams params{};
+  params.max_local_substeps = 32;
+  params.event_rate = 0.0;
+
+  amrex::MultiFab lterm_runtime;
+  const RuntimeSignature sig =
+    computeRuntimeODTLESTermSignature(lterm_runtime, params);
+
+  EXPECT_GT(sig.stepped_entries, 0);
+  EXPECT_EQ(sig.stepper_attempted_events, 0);
+  EXPECT_EQ(sig.stepper_applied_events, 0);
+  EXPECT_EQ(sig.stepper_rejected_events, 0);
+  EXPECT_EQ(sig.stepper_diffusion_only_catchup, sig.stepped_entries);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeODTEventRatePositiveActivatesEventSamplingAndPreservesMomentumOnlyBudget)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  pelec::odtles::ODTParams params{};
+  params.max_local_substeps = 128;
+  params.event_rate = 500.0;
+
+  amrex::MultiFab lterm_runtime;
+  const RuntimeSignature sig =
+    computeRuntimeODTLESTermSignature(lterm_runtime, params);
+
+  EXPECT_GT(sig.stepped_entries, 0);
+  EXPECT_GT(sig.stepper_attempted_events, 0);
+  EXPECT_GT(sig.stepper_applied_events, 0);
+  EXPECT_EQ(
+    sig.stepper_attempted_events,
+    sig.stepper_applied_events + sig.stepper_rejected_events);
+  EXPECT_GT(sig.stepper_attempted_events, sig.stepped_entries);
+
+  // Event activation must preserve the current momentum-only SGS contract.
+  EXPECT_NEAR(sig.sum_ueden, 0.0, tol);
+  EXPECT_LE(sig.l1_ueden, tol);
+  EXPECT_LE(sig.l1_others, tol);
 }
 
 TEST(

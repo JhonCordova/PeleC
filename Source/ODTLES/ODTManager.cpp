@@ -124,6 +124,9 @@ void
 ODTManager::setParams(const ODTParams& params)
 {
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    params.event_rate >= 0.0,
+    "ODTManager::setParams requires odt_event_rate >= 0");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
     params.subsegments_per_host_cell >= 3,
     "ODTManager::setParams requires subsegments_per_host_cell >= 3");
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(

@@ -84,6 +84,7 @@ pp.query("CI", CI);
 pp.query("PrT", PrT);
 pp.query("odt_max_local_substeps", odt_max_local_substeps);
 pp.query("odt_subsegments_per_host_cell", odt_subsegments_per_host_cell);
+pp.query("odt_event_rate", odt_event_rate);
 if (odt_subsegments_per_host_cell < 3) {
   amrex::Error(
     "pelec.odt_subsegments_per_host_cell must be >= 3");
@@ -91,6 +92,14 @@ if (odt_subsegments_per_host_cell < 3) {
 if ((odt_subsegments_per_host_cell % 2) == 0) {
   amrex::Error(
     "pelec.odt_subsegments_per_host_cell must be odd");
+}
+if (odt_event_rate < 0.0) {
+  amrex::Error(
+    "pelec.odt_event_rate must be >= 0");
+}
+if (odt_event_rate > 0.0 && odt_max_local_substeps <= 1) {
+  amrex::Error(
+    "pelec.odt_event_rate > 0 requires pelec.odt_max_local_substeps > 1");
 }
 {
   bool deprecated_flag = false;

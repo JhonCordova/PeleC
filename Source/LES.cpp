@@ -170,6 +170,7 @@ PeleC::getODTLESTerm(
   odt_runtime_params.enabled = true;
   odt_runtime_params.max_local_substeps = odt_max_local_substeps;
   odt_runtime_params.subsegments_per_host_cell = odt_subsegments_per_host_cell;
+  odt_runtime_params.event_rate = odt_event_rate;
   odt_manager.setParams(odt_runtime_params);
 
   // ODT runtime hookup:
@@ -301,6 +302,7 @@ configureRuntimeODTStepperControls(
 {
   step_ctrl.max_internal_iterations =
     odt_params.max_local_substeps > 0 ? odt_params.max_local_substeps : 1;
+  step_ctrl.sampler_controls.event_rate = odt_params.event_rate;
 
   // Production runtime path is now unambiguous:
   // always recover thermochemical state and use host molecular viscosity in

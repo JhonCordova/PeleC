@@ -223,6 +223,10 @@ odt_max_local_substeps       int           1
 # Must be odd and >= 3.
 odt_subsegments_per_host_cell int          3
 
+# ODTLES local runtime: Poisson event-rate for local eddy-event sampling
+# inside host-owned dt_LES. Set to zero for diffusion-only local stepping.
+odt_event_rate               Real          0.0
+
 # Runtime ODT line molecular momentum diffusion now always uses:
 # - thermochemical recovery + host molecular viscosity
 # - velocity-gradient viscous-flux form
