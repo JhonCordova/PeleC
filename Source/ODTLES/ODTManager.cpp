@@ -41,6 +41,27 @@ ODTManager::SupportData::allSameLevelAccepted() const noexcept
   return true;
 }
 
+bool
+ODTManager::SupportData::allRuntimeAccepted(
+  bool allow_amr_coarse_fine_support) const noexcept
+{
+  for (const auto& s : ordered_samples) {
+    const bool same_level_ok =
+      (s.provenance == SupportProvenance::SameLevelValidCell) ||
+      (s.provenance == SupportProvenance::SameLevelFilledGhost);
+    const bool amr_ok =
+      allow_amr_coarse_fine_support &&
+      (s.provenance == SupportProvenance::AMRCoarseFineFilled);
+    if (!(same_level_ok || amr_ok)) {
+      return false;
+    }
+    if (!s.has_value) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<ODTManager::ConservativeCell>
 ODTManager::SupportData::conservativeAveragesOrdered() const
 {
@@ -368,9 +389,10 @@ ODTManager::initializeLineStateFromSupportData(
   const amrex::Geometry& geom,
   const SupportData& support_data)
 {
+  const bool allow_amr = m_params.allow_amr_coarse_fine_support;
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    support_data.allSameLevelAccepted(),
-    "ODTManager initialize requires same-level accepted support provenance");
+    support_data.allRuntimeAccepted(allow_amr),
+    "ODTManager initialize requires runtime-accepted support provenance");
   const auto local_support_cell_averages =
     support_data.conservativeAveragesOrdered();
   return initializeLineStateFromLESSupportAverages(
@@ -385,9 +407,10 @@ ODTManager::reconcileLineStateFromSupportData(
   const amrex::Geometry& geom,
   const SupportData& support_data)
 {
+  const bool allow_amr = m_params.allow_amr_coarse_fine_support;
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    support_data.allSameLevelAccepted(),
-    "ODTManager reconcile requires same-level accepted support provenance");
+    support_data.allRuntimeAccepted(allow_amr),
+    "ODTManager reconcile requires runtime-accepted support provenance");
 
   assertLevelScope(level);
   auto* entry = findLineEntry(level, owner_cell, dir);

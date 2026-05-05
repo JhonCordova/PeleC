@@ -75,6 +75,9 @@ The embedded ODT contract is anchored to these host files and locations:
   - `pelec.odt_max_local_substeps`
   - `pelec.odt_subsegments_per_host_cell` (odd integer, `>= 3`)
   - `pelec.odt_event_rate` (`>= 0`; zero keeps diffusion-only local stepping)
+  - `pelec.odt_allow_amr_coarse_fine_support` (default `0`; when `1`, runtime
+    line preparation may accept host coarse-fine filled support entries if no
+    physical-boundary/invalid provenance is present)
 - Thermochemical recovery remains a local admissibility/EOS bridge only;
   persistent ODT line storage remains conservative (`rho`, momentum, `rhoE`,
   `rhoY_k`) with no persistent temperature variable.

@@ -171,6 +171,8 @@ PeleC::getODTLESTerm(
   odt_runtime_params.max_local_substeps = odt_max_local_substeps;
   odt_runtime_params.subsegments_per_host_cell = odt_subsegments_per_host_cell;
   odt_runtime_params.event_rate = odt_event_rate;
+  odt_runtime_params.allow_amr_coarse_fine_support =
+    odt_allow_amr_coarse_fine_support;
   odt_manager.setParams(odt_runtime_params);
 
   // ODT runtime hookup:
@@ -236,6 +238,27 @@ PeleC::getODTLESTerm(
     amrex::ParallelDescriptor::ReduceRealSum(l1_umy);
     amrex::ParallelDescriptor::ReduceRealSum(l1_umz);
     amrex::ParallelDescriptor::ReduceRealSum(l1_ueden);
+    const amrex::Real attempts = static_cast<amrex::Real>(
+      std::max<long>(0, stats.stepper_attempted_events));
+    const amrex::Real mean_sampled_cells =
+      (attempts > 0.0) ? (stats.stepper_sampled_interval_cells_sum / attempts) : 0.0;
+    const amrex::Real mean_sampled_length = (attempts > 0.0)
+                                              ? (stats.stepper_sampled_interval_length_sum / attempts)
+                                              : 0.0;
+    const amrex::Real mean_applied_cells =
+      (attempts > 0.0) ? (stats.stepper_applied_interval_cells_sum / attempts) : 0.0;
+    const amrex::Real mean_applied_length = (attempts > 0.0)
+                                               ? (stats.stepper_applied_interval_length_sum / attempts)
+                                               : 0.0;
+    const amrex::Real mean_accept_prob = (attempts > 0.0)
+                                           ? (stats.stepper_acceptance_probability_sum / attempts)
+                                           : 0.0;
+    const amrex::Real mean_proposal_rate = (attempts > 0.0)
+                                             ? (stats.stepper_proposal_rate_density_sum / attempts)
+                                             : 0.0;
+    const amrex::Real mean_target_rate = (attempts > 0.0)
+                                           ? (stats.stepper_target_rate_density_sum / attempts)
+                                           : 0.0;
 
     amrex::Print() << "ODTLES: stepped " << stats.stepped_entries
                    << " local lines over dt_LES with neutral SGS return. "
@@ -247,8 +270,18 @@ PeleC::getODTLESTerm(
                    << ", rejected_state_model_events="
                    << stats.stepper_rejected_state_model
                    << ", rejected_events=" << stats.stepper_rejected_events
+                   << ", accepted_amr_entries=" << stats.accepted_amr_entries
+                   << ", accepted_mixed_samelevel_amr_entries="
+                   << stats.accepted_mixed_samelevel_amr_entries
                    << ", diffusion_only_catchup_entries="
                    << stats.stepper_diffusion_only_catchup
+                   << ", mean_sampled_interval_cells=" << mean_sampled_cells
+                   << ", mean_sampled_interval_length=" << mean_sampled_length
+                   << ", mean_applied_interval_cells=" << mean_applied_cells
+                   << ", mean_applied_interval_length=" << mean_applied_length
+                   << ", mean_acceptance_probability=" << mean_accept_prob
+                   << ", mean_proposal_rate_density=" << mean_proposal_rate
+                   << ", mean_target_rate_density=" << mean_target_rate
                    << ", directional_momentum_columns="
                    << stats.moment_columns_built << ", l1_umx=" << l1_umx
                    << ", l1_umy=" << l1_umy << ", l1_umz=" << l1_umz
@@ -378,7 +411,8 @@ prepareRuntimeODTLineFromLESSupport(
     ++stats.rejected_boundary_entries;
     return out;
   }
-  if (n_amr > 0) {
+  const bool allow_amr = odt_manager.params().allow_amr_coarse_fine_support;
+  if (n_amr > 0 && !allow_amr) {
     ++stats.rejected_amr_entries;
     return out;
   }
@@ -387,8 +421,15 @@ prepareRuntimeODTLineFromLESSupport(
     return out;
   }
   AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-    support_data.allSameLevelAccepted(),
+    support_data.allRuntimeAccepted(allow_amr),
     "ODTLES support provenance policy mismatch in runtime hook");
+  if (n_amr > 0) {
+    ++stats.accepted_amr_entries;
+    if (support_data.count(ODTManager::SupportProvenance::SameLevelValidCell) > 0 ||
+        support_data.count(ODTManager::SupportProvenance::SameLevelFilledGhost) > 0) {
+      ++stats.accepted_mixed_samelevel_amr_entries;
+    }
+  }
 
   auto* entry = odt_manager.findLineEntry(level, owner_cell, dir);
   if (entry != nullptr && entry->state.valid()) {
@@ -504,6 +545,26 @@ accumulateRuntimeODTMomentumLESTerm(
         stats.stepper_rejected_state_model +=
           step_rep.rejected_state_model_events;
         stats.stepper_rejected_events += step_rep.rejected_events;
+        for (const auto& tr : step_rep.trace) {
+          if (!tr.sampled_interval.valid()) {
+            continue;
+          }
+          stats.stepper_sampled_interval_cells_sum +=
+            static_cast<amrex::Real>(tr.sampled_interval.size());
+          stats.stepper_sampled_interval_length_sum +=
+            tr.sampled_interval_physical_length;
+          if (tr.applied_interval.valid()) {
+            stats.stepper_applied_interval_cells_sum +=
+              static_cast<amrex::Real>(tr.applied_interval.size());
+            stats.stepper_applied_interval_length_sum +=
+              tr.applied_interval_physical_length;
+          }
+          stats.stepper_acceptance_probability_sum +=
+            tr.state_acceptance_probability;
+          stats.stepper_proposal_rate_density_sum +=
+            tr.state_proposal_rate_density;
+          stats.stepper_target_rate_density_sum += tr.state_event_hazard;
+        }
         if (step_rep.closed_by_diffusion_only_catchup) {
           ++stats.stepper_diffusion_only_catchup;
         }

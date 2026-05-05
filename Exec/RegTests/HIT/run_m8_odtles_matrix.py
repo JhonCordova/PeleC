@@ -65,11 +65,20 @@ def parse_log(log_path: Path):
         "rejected_amr_total": 0,
         "rejected_invalid_total": 0,
         "rejected_mixed_total": 0,
+        "accepted_amr_entries_total": 0,
+        "accepted_mixed_samelevel_amr_entries_total": 0,
         "l1_umx_last": 0.0,
         "l1_umy_last": 0.0,
         "l1_umz_last": 0.0,
         "l1_ueden_last": 0.0,
         "l1_ueden_max_abs": 0.0,
+        "mean_sampled_interval_cells_last": 0.0,
+        "mean_sampled_interval_length_last": 0.0,
+        "mean_applied_interval_cells_last": 0.0,
+        "mean_applied_interval_length_last": 0.0,
+        "mean_acceptance_probability_last": 0.0,
+        "mean_proposal_rate_density_last": 0.0,
+        "mean_target_rate_density_last": 0.0,
         "last_step": None,
         "last_time": None,
         "last_dt": None,
@@ -95,6 +104,12 @@ def parse_log(log_path: Path):
                     fields["rejected_state_model_events"]
                 )
                 data["rejected_events_total"] += to_int(fields["rejected_events"])
+                data["accepted_amr_entries_total"] += to_int(
+                    fields.get("accepted_amr_entries", "0")
+                )
+                data["accepted_mixed_samelevel_amr_entries_total"] += to_int(
+                    fields.get("accepted_mixed_samelevel_amr_entries", "0")
+                )
                 data["diffusion_only_catchup_entries_total"] += to_int(
                     fields["diffusion_only_catchup_entries"]
                 )
@@ -107,6 +122,27 @@ def parse_log(log_path: Path):
                 data["l1_ueden_last"] = to_float(fields["l1_ueden"])
                 data["l1_ueden_max_abs"] = max(
                     data["l1_ueden_max_abs"], abs(data["l1_ueden_last"])
+                )
+                data["mean_sampled_interval_cells_last"] = to_float(
+                    fields.get("mean_sampled_interval_cells", "0")
+                )
+                data["mean_sampled_interval_length_last"] = to_float(
+                    fields.get("mean_sampled_interval_length", "0")
+                )
+                data["mean_applied_interval_cells_last"] = to_float(
+                    fields.get("mean_applied_interval_cells", "0")
+                )
+                data["mean_applied_interval_length_last"] = to_float(
+                    fields.get("mean_applied_interval_length", "0")
+                )
+                data["mean_acceptance_probability_last"] = to_float(
+                    fields.get("mean_acceptance_probability", "0")
+                )
+                data["mean_proposal_rate_density_last"] = to_float(
+                    fields.get("mean_proposal_rate_density", "0")
+                )
+                data["mean_target_rate_density_last"] = to_float(
+                    fields.get("mean_target_rate_density", "0")
                 )
                 continue
 
@@ -295,11 +331,20 @@ def main():
         "rejected_amr_total",
         "rejected_invalid_total",
         "rejected_mixed_total",
+        "accepted_amr_entries_total",
+        "accepted_mixed_samelevel_amr_entries_total",
         "l1_umx_last",
         "l1_umy_last",
         "l1_umz_last",
         "l1_ueden_last",
         "l1_ueden_max_abs",
+        "mean_sampled_interval_cells_last",
+        "mean_sampled_interval_length_last",
+        "mean_applied_interval_cells_last",
+        "mean_applied_interval_length_last",
+        "mean_acceptance_probability_last",
+        "mean_proposal_rate_density_last",
+        "mean_target_rate_density_last",
         "run_dir",
         "log_file",
         "command",

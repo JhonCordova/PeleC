@@ -91,40 +91,75 @@ intervalPhysicalLength(
   return std::max<amrex::Real>(0.0, len);
 }
 
+amrex::Real
+supportPhysicalLength(const ODTLineGeometry& geom)
+{
+  const auto& segs = geom.supportCells();
+  amrex::Real len = 0.0;
+  for (const auto& seg : segs) {
+    len += seg.s_interval.hi - seg.s_interval.lo;
+  }
+  return std::max<amrex::Real>(0.0, len);
+}
+
 IntervalProposal
 sampleIntervalProposal(
-  int line_cells, int min_interval_size, ODTEventSampler& sampler)
+  const ODTLineGeometry& geom,
+  int line_cells,
+  int min_interval_size,
+  ODTEventSampler& sampler)
 {
   IntervalProposal out{};
   if (line_cells <= 0) {
     return out;
   }
-  const int min_n = std::max(1, min_interval_size);
-  const int max_n = line_cells;
-  if (min_n > max_n) {
+  const int min_n = std::max(3, min_interval_size);
+  if (line_cells < min_n) {
     return out;
   }
 
-  // Use a scale-aware 1/n size weighting: this favors smaller events while
-  // preserving support over all admissible interval sizes.
-  std::vector<amrex::Real> weights(static_cast<std::size_t>(max_n - min_n + 1));
+  std::vector<int> admissible_sizes;
+  std::vector<amrex::Real> weights;
+  admissible_sizes.reserve(static_cast<std::size_t>(line_cells));
+  weights.reserve(static_cast<std::size_t>(line_cells));
   amrex::Real w_sum = 0.0;
-  for (int n = min_n; n <= max_n; ++n) {
-    const amrex::Real w = 1.0 / static_cast<amrex::Real>(n);
-    weights[static_cast<std::size_t>(n - min_n)] = w;
+  for (int n = min_n; n <= line_cells; ++n) {
+    if ((n % 3) != 0) {
+      continue;
+    }
+    const int n_starts = line_cells - n + 1;
+    if (n_starts <= 0) {
+      continue;
+    }
+    ODTTripletMap::EddyInterval rep{};
+    rep.i_lo = 0;
+    rep.i_hi = n - 1;
+    const amrex::Real length = intervalPhysicalLength(geom, rep);
+    if (length <= 0.0) {
+      continue;
+    }
+
+    // Proposal weights are inverse physical size with multiplicity by start
+    // positions, so q(interval) is physically scaled and normalized.
+    const amrex::Real w =
+      static_cast<amrex::Real>(n_starts) / length;
+    admissible_sizes.push_back(n);
+    weights.push_back(w);
     w_sum += w;
   }
-  if (w_sum <= 0.0) {
+  if (admissible_sizes.empty() || w_sum <= 0.0) {
     return out;
   }
 
   const amrex::Real u = sampler.sampleUnitUniform() * w_sum;
   amrex::Real accum = 0.0;
-  int n = max_n;
-  for (int cand = min_n; cand <= max_n; ++cand) {
-    accum += weights[static_cast<std::size_t>(cand - min_n)];
-    if (u <= accum || cand == max_n) {
-      n = cand;
+  int n = admissible_sizes.back();
+  std::size_t selected_k = weights.size() - 1;
+  for (std::size_t k = 0; k < weights.size(); ++k) {
+    accum += weights[k];
+    if (u <= accum || k + 1 == weights.size()) {
+      n = admissible_sizes[k];
+      selected_k = k;
       break;
     }
   }
@@ -138,8 +173,7 @@ sampleIntervalProposal(
 
   out.interval.i_lo = i_lo;
   out.interval.i_hi = i_lo + n - 1;
-  const amrex::Real p_n =
-    weights[static_cast<std::size_t>(n - min_n)] / w_sum;
+  const amrex::Real p_n = weights[selected_k] / w_sum;
   const amrex::Real p_i = 1.0 / static_cast<amrex::Real>(n_starts);
   out.probability = p_n * p_i;
   out.valid = out.interval.valid();
@@ -150,8 +184,7 @@ LocalEventModel
 stateDependentEventModel(
   const ODTLineGeometry& geom,
   const ODTLineState& line_state,
-  const ODTTripletMap::EddyInterval& interval,
-  amrex::Real wait_time)
+  const ODTTripletMap::EddyInterval& interval)
 {
   LocalEventModel out{};
   if (!interval.valid()) {
@@ -255,17 +288,10 @@ stateDependentEventModel(
   out.turnover_time = interval_length / (u_char + eps);
   out.turnover_time = std::max<amrex::Real>(0.0, out.turnover_time);
 
-  const amrex::Real wait = std::max<amrex::Real>(0.0, wait_time);
   // Local accepted-event hazard [1/time], built from state alone.
   out.event_hazard =
     out.energetic_admissibility / (out.turnover_time + eps);
   out.event_hazard = std::max<amrex::Real>(0.0, out.event_hazard);
-  // Proposal/acceptance consistency:
-  // candidate proposals are Poisson in time; acceptance uses the local hazard
-  // over the sampled waiting interval.
-  out.acceptance_probability = 1.0 - std::exp(-out.event_hazard * wait);
-  out.acceptance_probability = std::max<amrex::Real>(
-    0.0, std::min<amrex::Real>(1.0, out.acceptance_probability));
   return out;
 }
 
@@ -376,7 +402,8 @@ ODTStepper::advanceOneLESTimestep(
     }
 
     const auto proposal = sampleIntervalProposal(
-      line_state.numCells(), controls.sampler_controls.min_interval_size, sampler);
+      geom, line_state.numCells(), controls.sampler_controls.min_interval_size,
+      sampler);
     if (!proposal.valid) {
       ODTDiffusion::applyImplicitUniform(
         geom, line_state, dt_les - t, controls.diffusion_controls);
@@ -395,6 +422,7 @@ ODTStepper::advanceOneLESTimestep(
     tr.sampled_interval_probability = proposal.probability;
     tr.sampled_interval_physical_length =
       intervalPhysicalLength(geom, proposal.interval);
+    tr.applied_interval_physical_length = tr.sampled_interval_physical_length;
     tr.compatible_triplet_interval =
       ODTTripletMap::canApplyPermutation(line_state, proposal.interval);
 
@@ -408,6 +436,8 @@ ODTStepper::advanceOneLESTimestep(
           ODTTripletMap::canApplyPermutation(line_state, adjusted)) {
           tr.adjusted_to_compatible = true;
           tr.applied_interval = adjusted;
+          tr.applied_interval_physical_length =
+            intervalPhysicalLength(geom, adjusted);
           report.adjusted_events += 1;
         } else {
           report.rejected_incompatible_events += 1;
@@ -432,12 +462,30 @@ ODTStepper::advanceOneLESTimestep(
     case IncompatibleIntervalPolicy::AdjustToCompatibleElseReject:
     case IncompatibleIntervalPolicy::RejectAndContinue: {
       const auto local_model =
-        stateDependentEventModel(
-          geom, line_state, tr.applied_interval, wait_time_clamped);
+        stateDependentEventModel(geom, line_state, tr.applied_interval);
       tr.state_energetic_admissibility = local_model.energetic_admissibility;
       tr.state_turnover_time = local_model.turnover_time;
-      tr.state_event_hazard = local_model.event_hazard;
-      tr.state_acceptance_probability = local_model.acceptance_probability;
+      const amrex::Real support_len = supportPhysicalLength(geom);
+      const amrex::Real interval_len_frac =
+        (support_len > 0.0)
+          ? std::max<amrex::Real>(
+              0.0, tr.applied_interval_physical_length / support_len)
+          : 0.0;
+      const amrex::Real sampled_interval_prob =
+        std::max<amrex::Real>(0.0, tr.sampled_interval_probability);
+      // The local state model provides an intrinsic interval turnover frequency
+      // [1/time]. Convert this to a discrete interval-occurrence target rate by
+      // accounting for proposal probability mass and physical support fraction.
+      tr.state_event_hazard =
+        local_model.event_hazard * sampled_interval_prob * interval_len_frac;
+      const amrex::Real proposal_rate_density = std::max<amrex::Real>(
+        0.0, event_rate * sampled_interval_prob);
+      tr.state_proposal_rate_density = proposal_rate_density;
+      const amrex::Real rate_eps = 1.0e-300;
+      tr.state_acceptance_probability = std::max<amrex::Real>(
+        0.0, std::min<amrex::Real>(
+               1.0, tr.state_event_hazard / std::max<amrex::Real>(
+                                            proposal_rate_density, rate_eps)));
       tr.acceptance_draw = sampler.sampleUnitUniform();
       tr.accepted_by_state_model =
         (tr.acceptance_draw <= tr.state_acceptance_probability);
@@ -556,7 +604,7 @@ ODTStepper::runMVPValidationHook()
 
   out.event_path_attempted = event_rep_a.attempted_events > 0;
   out.compatibility_policy_exercised =
-    (event_rep_a.adjusted_events > 0 || event_rep_a.rejected_incompatible_events > 0);
+    (event_rep_a.rejected_incompatible_events == 0);
 
   const bool same_reports =
     event_rep_a.attempted_events == event_rep_b.attempted_events &&

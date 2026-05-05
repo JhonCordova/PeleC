@@ -17,6 +17,10 @@ struct ODTParams
   // Poisson candidate sampling rate for local ODT eddy trials inside dt_LES.
   // Set to zero to keep diffusion-only local stepping.
   amrex::Real event_rate = 0.0;
+  // Optional runtime extension: allow support entries sourced from host
+  // coarse-fine fills when no boundary/invalid provenance is present.
+  // Default remains strict same-level-only acceptance.
+  bool allow_amr_coarse_fine_support = false;
 };
 
 } // namespace pelec::odtles

@@ -56,6 +56,7 @@ public:
 
     int count(SupportProvenance p) const noexcept;
     bool allSameLevelAccepted() const noexcept;
+    bool allRuntimeAccepted(bool allow_amr_coarse_fine_support) const noexcept;
     std::vector<ConservativeCell> conservativeAveragesOrdered() const;
     ConservativeCell ownerAverage(const ODTLineGeometry& geom) const;
   };

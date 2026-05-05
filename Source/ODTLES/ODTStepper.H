@@ -40,9 +40,11 @@ public:
     amrex::Real wait_time = 0.0;
     amrex::Real sampled_interval_probability = 0.0;
     amrex::Real sampled_interval_physical_length = 0.0;
+    amrex::Real applied_interval_physical_length = 0.0;
     amrex::Real state_energetic_admissibility = 0.0;
     amrex::Real state_turnover_time = 0.0;
-    amrex::Real state_event_hazard = 0.0;
+    amrex::Real state_event_hazard = 0.0; // target accepted-event rate density
+    amrex::Real state_proposal_rate_density = 0.0;
     amrex::Real state_acceptance_probability = 0.0;
     amrex::Real acceptance_draw = 1.0;
     ODTTripletMap::EddyInterval sampled_interval{};

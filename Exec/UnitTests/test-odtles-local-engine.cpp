@@ -7,6 +7,7 @@
 #include <array>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 
 #include <AMReX_Array.H>
 #include <AMReX_Box.H>
@@ -1149,18 +1150,34 @@ TEST(ODTLESLocalEngine, StepperStateModelEventRateActsAsSamplingScale)
     }
     return sum / static_cast<amrex::Real>(trace.size());
   };
-  auto check_acceptance_identity = [=](const auto& trace) {
+  amrex::Real support_len = 0.0;
+  for (const auto& seg : line_geom.supportCells()) {
+    support_len += seg.s_interval.hi - seg.s_interval.lo;
+  }
+  support_len = std::max<amrex::Real>(0.0, support_len);
+  auto check_acceptance_identity = [=](const auto& trace, amrex::Real event_rate) {
     for (const auto& tr : trace) {
-      const amrex::Real expected = std::max<amrex::Real>(
-        0.0, std::min<amrex::Real>(
-               1.0,
-               1.0 - std::exp(
-                       -tr.state_event_hazard *
-                       std::max<amrex::Real>(0.0, tr.wait_time))));
-      EXPECT_NEAR(tr.state_acceptance_probability, expected, tol);
-      const amrex::Real expected_hazard =
+      const amrex::Real intrinsic_hazard =
         tr.state_energetic_admissibility / (tr.state_turnover_time + eps);
-      EXPECT_NEAR(tr.state_event_hazard, expected_hazard, tol);
+      const amrex::Real interval_len_frac =
+        (support_len > 0.0)
+          ? std::max<amrex::Real>(
+              0.0, tr.applied_interval_physical_length / support_len)
+          : 0.0;
+      const amrex::Real sampled_interval_prob =
+        std::max<amrex::Real>(0.0, tr.sampled_interval_probability);
+      const amrex::Real expected_target_rate =
+        intrinsic_hazard * sampled_interval_prob * interval_len_frac;
+      const amrex::Real expected_proposal_rate =
+        std::max<amrex::Real>(
+          0.0, event_rate * sampled_interval_prob);
+      const amrex::Real expected_acceptance = std::max<amrex::Real>(
+        0.0, std::min<amrex::Real>(
+               1.0, expected_target_rate / std::max<amrex::Real>(
+                                            expected_proposal_rate, 1.0e-300)));
+      EXPECT_NEAR(tr.state_event_hazard, expected_target_rate, tol);
+      EXPECT_NEAR(tr.state_proposal_rate_density, expected_proposal_rate, tol);
+      EXPECT_NEAR(tr.state_acceptance_probability, expected_acceptance, tol);
     }
   };
 
@@ -1171,8 +1188,58 @@ TEST(ODTLESLocalEngine, StepperStateModelEventRateActsAsSamplingScale)
   EXPECT_GT(rep_high.attempted_events, rep_low.attempted_events);
   EXPECT_LT(mean_wait(rep_high.trace), mean_wait(rep_low.trace));
 
-  check_acceptance_identity(rep_low.trace);
-  check_acceptance_identity(rep_high.trace);
+  check_acceptance_identity(rep_low.trace, low_rate_ctrl.sampler_controls.event_rate);
+  check_acceptance_identity(
+    rep_high.trace, high_rate_ctrl.sampler_controls.event_rate);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  StepperProposalProbabilityUsesInversePhysicalIntervalLengthScaling)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0, 5);
+  auto state =
+    makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+      line_geom, 0.0, 0.20);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 2048;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 5.0e3;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 99123ULL;
+
+  const auto rep = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, state, 1.0e-2, step_ctrl);
+
+  ASSERT_TRUE(rep.reached_dt_les);
+  ASSERT_GT(rep.attempted_events, 10);
+  EXPECT_EQ(rep.rejected_incompatible_events, 0);
+
+  amrex::Real prod_min = std::numeric_limits<amrex::Real>::max();
+  amrex::Real prod_max = 0.0;
+  for (const auto& tr : rep.trace) {
+    ASSERT_TRUE(tr.sampled_interval.valid());
+    EXPECT_TRUE(tr.compatible_triplet_interval);
+    const amrex::Real prod =
+      tr.sampled_interval_probability * tr.sampled_interval_physical_length;
+    prod_min = std::min(prod_min, prod);
+    prod_max = std::max(prod_max, prod);
+  }
+  const amrex::Real denom = std::max<amrex::Real>(prod_max, 1.0e-300);
+  const amrex::Real rel_spread = (prod_max - prod_min) / denom;
+  EXPECT_LE(rel_spread, 1.0e-12);
 }
 
 TEST(ODTLESLocalEngine, StepperEventSamplingAvoidsPathologicalReplayWhenSeedAdvances)
@@ -2579,6 +2646,54 @@ TEST(ODTLESLocalEngine, RuntimeODTLinePreparationRejectsUnsupportedProvenance)
   EXPECT_EQ(stats.rejected_invalid_entries, 0);
   EXPECT_EQ(stats.rejected_mixed_entries, 0);
   EXPECT_FALSE(odt_manager.hasLineEntry(0, owner, 0));
+}
+
+TEST(
+  ODTLESLocalEngine,
+  RuntimeODTLinePreparationCanAcceptAMRCoarseFineSupportWhenEnabled)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(4, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(5.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+
+  const amrex::Box patch(
+    amrex::IntVect(AMREX_D_DECL(1, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(3, 0, 0)));
+  amrex::BoxArray ba(patch);
+  amrex::DistributionMapping dm(ba);
+
+  amrex::MultiFab state_valid(ba, dm, NVAR, 0);
+  amrex::MultiFab state_same_level(ba, dm, NVAR, 0);
+  amrex::MultiFab state_host_filled(ba, dm, NVAR, 1);
+  state_valid.setVal(0.0);
+  state_same_level.setVal(0.0);
+  state_host_filled.setVal(7.0);
+  amrex::MultiFab::Copy(state_same_level, state_valid, 0, 0, NVAR, 0);
+  amrex::MultiFab::Copy(state_host_filled, state_valid, 0, 0, NVAR, 0);
+
+  pelec::odtles::ODTManager odt_manager;
+  pelec::odtles::ODTParams params{};
+  params.allow_amr_coarse_fine_support = true;
+  odt_manager.setParams(params);
+  odt_manager.initializeLevel(0, ba, dm);
+  pelec::odtles::RuntimeDepositionStats stats{};
+  const amrex::IntVect owner(AMREX_D_DECL(1, 0, 0));
+
+  const auto prep = pelec::odtles::prepareRuntimeODTLineFromLESSupport(
+    0, owner, 0, geom, odt_manager, state_valid, state_same_level,
+    state_host_filled, stats);
+
+  EXPECT_TRUE(prep.accepted);
+  EXPECT_TRUE(prep.initialized);
+  EXPECT_FALSE(prep.reconciled);
+  ASSERT_NE(prep.line_entry, nullptr);
+  EXPECT_EQ(stats.rejected_amr_entries, 0);
+  EXPECT_EQ(stats.accepted_amr_entries, 1);
+  EXPECT_TRUE(odt_manager.hasLineEntry(0, owner, 0));
 }
 
 TEST(

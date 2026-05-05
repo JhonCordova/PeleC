@@ -67,6 +67,7 @@ amrex::Real PeleC::PrT = 1.0;
 int PeleC::odt_max_local_substeps = 1;
 int PeleC::odt_subsegments_per_host_cell = 3;
 amrex::Real PeleC::odt_event_rate = 0.0;
+bool PeleC::odt_allow_amr_coarse_fine_support = false;
 amrex::Real PeleC::eb_boundary_T = 1.0;
 bool PeleC::eb_isothermal = true;
 bool PeleC::eb_noslip = true;

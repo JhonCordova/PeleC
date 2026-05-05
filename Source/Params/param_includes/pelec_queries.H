@@ -85,6 +85,8 @@ pp.query("PrT", PrT);
 pp.query("odt_max_local_substeps", odt_max_local_substeps);
 pp.query("odt_subsegments_per_host_cell", odt_subsegments_per_host_cell);
 pp.query("odt_event_rate", odt_event_rate);
+pp.query(
+  "odt_allow_amr_coarse_fine_support", odt_allow_amr_coarse_fine_support);
 if (odt_subsegments_per_host_cell < 3) {
   amrex::Error(
     "pelec.odt_subsegments_per_host_cell must be >= 3");
