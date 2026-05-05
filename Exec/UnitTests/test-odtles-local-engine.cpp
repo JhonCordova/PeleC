@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <array>
 #include <fstream>
@@ -250,6 +251,118 @@ maxAbsMomentumComponentChange(
     }
   }
   return max_abs;
+}
+
+pelec::odtles::ODTLineState
+makeAdmissibleVelocityProfileState(
+  const pelec::odtles::ODTLineGeometry& geom,
+  amrex::Real u_center,
+  amrex::Real u_slope)
+{
+  pelec::odtles::ODTLineState state;
+  state.initialize(geom);
+
+  amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+  amrex::Real ysum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] = static_cast<amrex::Real>(n + 1);
+    ysum += Y_ref[n];
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] /= ysum;
+  }
+
+  auto eos = pele::physics::PhysicsType::eos();
+  const amrex::Real T_ref = 400.0;
+  const amrex::Real mid =
+    0.5 * static_cast<amrex::Real>(std::max(0, state.numCells() - 1));
+  for (int i = 0; i < state.numCells(); ++i) {
+    ConservativeCell c{};
+    c.rho = 1.0;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+    }
+    const amrex::Real u =
+      u_center + u_slope * (static_cast<amrex::Real>(i) - mid);
+    c.rhou = c.rho * u;
+    c.rhov = 0.0;
+    c.rhow = 0.0;
+    amrex::Real e_ref = 0.0;
+    eos.RTY2E(c.rho, T_ref, Y_ref, e_ref);
+    c.rhoE = c.rho * (e_ref + 0.5 * u * u);
+    state.setCell(i, c);
+  }
+  state.setValid(true);
+  return state;
+}
+
+pelec::odtles::ODTLineState
+makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+  const pelec::odtles::ODTLineGeometry& geom,
+  amrex::Real u_center,
+  amrex::Real u_ds_slope)
+{
+  pelec::odtles::ODTLineState state;
+  state.initialize(geom);
+
+  amrex::Real Y_ref[NUM_SPECIES] = {0.0};
+  amrex::Real ysum = 0.0;
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] = static_cast<amrex::Real>(n + 1);
+    ysum += Y_ref[n];
+  }
+  for (int n = 0; n < NUM_SPECIES; ++n) {
+    Y_ref[n] /= ysum;
+  }
+
+  auto eos = pele::physics::PhysicsType::eos();
+  const amrex::Real T_ref = 400.0;
+  const auto& segs = geom.supportCells();
+  AMREX_ALWAYS_ASSERT(static_cast<int>(segs.size()) == state.numCells());
+
+  for (int i = 0; i < state.numCells(); ++i) {
+    ConservativeCell c{};
+    c.rho = 1.0;
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      c.rhoY[static_cast<std::size_t>(n)] = c.rho * Y_ref[n];
+    }
+    const amrex::Real s = segs[static_cast<std::size_t>(i)].s_center;
+    const amrex::Real u = u_center + u_ds_slope * s;
+    c.rhou = c.rho * u;
+    c.rhov = 0.0;
+    c.rhow = 0.0;
+    amrex::Real e_ref = 0.0;
+    eos.RTY2E(c.rho, T_ref, Y_ref, e_ref);
+    c.rhoE = c.rho * (e_ref + 0.5 * u * u);
+    state.setCell(i, c);
+  }
+  state.setValid(true);
+  return state;
+}
+
+void
+applyUniformVelocityTranslation(
+  pelec::odtles::ODTLineState& state,
+  amrex::Real du,
+  amrex::Real dv,
+  amrex::Real dw)
+{
+  for (int i = 0; i < state.numCells(); ++i) {
+    auto c = state.cell(i);
+    const amrex::Real u0 = c.rhou / c.rho;
+    const amrex::Real v0 = c.rhov / c.rho;
+    const amrex::Real w0 = c.rhow / c.rho;
+    const amrex::Real u1 = u0 + du;
+    const amrex::Real v1 = v0 + dv;
+    const amrex::Real w1 = w0 + dw;
+    const amrex::Real ke0 = 0.5 * (u0 * u0 + v0 * v0 + w0 * w0);
+    const amrex::Real ke1 = 0.5 * (u1 * u1 + v1 * v1 + w1 * w1);
+    c.rhou = c.rho * u1;
+    c.rhov = c.rho * v1;
+    c.rhow = c.rho * w1;
+    c.rhoE += c.rho * (ke1 - ke0);
+    state.setCell(i, c);
+  }
 }
 
 void
@@ -504,6 +617,7 @@ struct RuntimeSignature
   long moment_columns_built = 0;
   long stepper_attempted_events = 0;
   long stepper_applied_events = 0;
+  long stepper_rejected_state_model = 0;
   long stepper_rejected_events = 0;
   long stepper_diffusion_only_catchup = 0;
 };
@@ -640,6 +754,7 @@ computeRuntimeODTLESTermSignature(
   sig.moment_columns_built = stats.moment_columns_built;
   sig.stepper_attempted_events = stats.stepper_attempted_events;
   sig.stepper_applied_events = stats.stepper_applied_events;
+  sig.stepper_rejected_state_model = stats.stepper_rejected_state_model;
   sig.stepper_rejected_events = stats.stepper_rejected_events;
   sig.stepper_diffusion_only_catchup = stats.stepper_diffusion_only_catchup;
   return sig;
@@ -736,6 +851,389 @@ TEST(ODTLESLocalEngine, StepperMVPValidation)
 
   EXPECT_LE(rep.closure_error, tol);
   EXPECT_LE(rep.overshoot_amount, tol);
+}
+
+TEST(ODTLESLocalEngine, StepperStateModelRejectsUniformVelocityEvents)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  auto line_state = makeAdmissibleVelocityProfileState(line_geom, 0.3, 0.0);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 256;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 500.0;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 111ULL;
+
+  const auto rep = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, line_state, 1.0e-2, step_ctrl);
+
+  EXPECT_TRUE(rep.reached_dt_les);
+  EXPECT_GT(rep.attempted_events, 0);
+  EXPECT_EQ(rep.applied_events, 0);
+  EXPECT_EQ(rep.rejected_events, rep.attempted_events);
+  EXPECT_EQ(rep.rejected_incompatible_events, 0);
+  EXPECT_EQ(rep.rejected_state_model_events, rep.attempted_events);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  StepperStateModelProducesDifferentAcceptanceForDifferentLineStates)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  auto uniform_state = makeAdmissibleVelocityProfileState(line_geom, 0.3, 0.0);
+  auto sheared_state = makeAdmissibleVelocityProfileState(line_geom, 0.0, 0.2);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 256;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 500.0;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 222ULL;
+
+  const auto rep_uniform = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, uniform_state, 1.0e-2, step_ctrl);
+  const auto rep_sheared = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, sheared_state, 1.0e-2, step_ctrl);
+
+  auto mean_acceptance_prob = [](const auto& trace) -> amrex::Real {
+    if (trace.empty()) {
+      return 0.0;
+    }
+    amrex::Real sum = 0.0;
+    for (const auto& tr : trace) {
+      sum += tr.state_acceptance_probability;
+    }
+    return sum / static_cast<amrex::Real>(trace.size());
+  };
+
+  EXPECT_GT(rep_uniform.attempted_events, 0);
+  EXPECT_GT(rep_sheared.attempted_events, 0);
+  EXPECT_GT(
+    mean_acceptance_prob(rep_sheared.trace),
+    mean_acceptance_prob(rep_uniform.trace));
+}
+
+TEST(ODTLESLocalEngine, StepperStateModelTracksEnergeticTimescaleIntensity)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  auto low_energy_state = makeAdmissibleVelocityProfileState(line_geom, 0.0, 0.03);
+  auto high_energy_state = makeAdmissibleVelocityProfileState(line_geom, 0.0, 0.30);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 256;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 500.0;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 444ULL;
+
+  const auto rep_low = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, low_energy_state, 1.0e-2, step_ctrl);
+  const auto rep_high = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, high_energy_state, 1.0e-2, step_ctrl);
+
+  auto mean_acceptance_prob = [](const auto& trace) -> amrex::Real {
+    if (trace.empty()) {
+      return 0.0;
+    }
+    amrex::Real sum = 0.0;
+    for (const auto& tr : trace) {
+      sum += tr.state_acceptance_probability;
+    }
+    return sum / static_cast<amrex::Real>(trace.size());
+  };
+  auto mean_turnover_time = [](const auto& trace) -> amrex::Real {
+    if (trace.empty()) {
+      return 0.0;
+    }
+    amrex::Real sum = 0.0;
+    for (const auto& tr : trace) {
+      sum += tr.state_turnover_time;
+    }
+    return sum / static_cast<amrex::Real>(trace.size());
+  };
+
+  EXPECT_GT(rep_low.attempted_events, 0);
+  EXPECT_GT(rep_high.attempted_events, 0);
+  EXPECT_GT(
+    mean_acceptance_prob(rep_high.trace), mean_acceptance_prob(rep_low.trace));
+  EXPECT_LT(mean_turnover_time(rep_high.trace), mean_turnover_time(rep_low.trace));
+}
+
+TEST(
+  ODTLESLocalEngine,
+  StepperStateModelIsGalileanInvariantUnderUniformTranslation)
+{
+  constexpr amrex::Real tol = 1.0e-14;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  auto base_state = makeAdmissibleVelocityProfileState(line_geom, 0.0, 0.2);
+  auto shifted_state = base_state;
+  applyUniformVelocityTranslation(shifted_state, 1.25, -0.70, 0.35);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 256;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 500.0;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 333ULL;
+
+  const auto rep_base = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, base_state, 1.0e-2, step_ctrl);
+  const auto rep_shifted = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, shifted_state, 1.0e-2, step_ctrl);
+
+  ASSERT_EQ(rep_base.attempted_events, rep_shifted.attempted_events);
+  ASSERT_EQ(rep_base.trace.size(), rep_shifted.trace.size());
+  EXPECT_EQ(rep_base.applied_events, rep_shifted.applied_events);
+  EXPECT_EQ(
+    rep_base.rejected_state_model_events, rep_shifted.rejected_state_model_events);
+  EXPECT_EQ(rep_base.rejected_events, rep_shifted.rejected_events);
+
+  for (std::size_t i = 0; i < rep_base.trace.size(); ++i) {
+    const auto& t0 = rep_base.trace[i];
+    const auto& t1 = rep_shifted.trace[i];
+    EXPECT_NEAR(
+      t0.state_energetic_admissibility, t1.state_energetic_admissibility, tol);
+    EXPECT_NEAR(t0.state_turnover_time, t1.state_turnover_time, tol);
+    EXPECT_NEAR(
+      t0.state_acceptance_probability, t1.state_acceptance_probability, tol);
+    EXPECT_EQ(t0.accepted_by_state_model, t1.accepted_by_state_model);
+  }
+}
+
+TEST(
+  ODTLESLocalEngine,
+  StepperStateModelUsesPhysicalIntervalLengthAcrossSubsegmentResolutions)
+{
+  constexpr amrex::Real tol_energetic = 5.0e-2;
+  constexpr amrex::Real tol_turnover = 5.0e-2;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom_coarse(geom, 0, owner, 0, 3);
+  pelec::odtles::ODTLineGeometry line_geom_fine(geom, 0, owner, 0, 9);
+  auto coarse_state =
+    makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+      line_geom_coarse, 0.0, 0.25);
+  auto fine_state =
+    makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+      line_geom_fine, 0.0, 0.25);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl_coarse{};
+  step_ctrl_coarse.max_internal_iterations = 2048;
+  step_ctrl_coarse.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl_coarse.sampler_controls.event_rate = 1.0e5;
+  step_ctrl_coarse.sampler_controls.min_interval_size = coarse_state.numCells();
+  step_ctrl_coarse.sampler_controls.deterministic = true;
+  step_ctrl_coarse.sampler_controls.seed = 991ULL;
+
+  auto step_ctrl_fine = step_ctrl_coarse;
+  step_ctrl_fine.sampler_controls.min_interval_size = fine_state.numCells();
+
+  const auto rep_coarse = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom_coarse, coarse_state, 1.0e-4, step_ctrl_coarse);
+  const auto rep_fine = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom_fine, fine_state, 1.0e-4, step_ctrl_fine);
+
+  ASSERT_TRUE(rep_coarse.reached_dt_les);
+  ASSERT_TRUE(rep_fine.reached_dt_les);
+  ASSERT_GT(rep_coarse.attempted_events, 0);
+  ASSERT_GT(rep_fine.attempted_events, 0);
+  ASSERT_FALSE(rep_coarse.trace.empty());
+  ASSERT_FALSE(rep_fine.trace.empty());
+
+  const auto& t_coarse = rep_coarse.trace.front();
+  const auto& t_fine = rep_fine.trace.front();
+  EXPECT_NEAR(
+    t_coarse.state_energetic_admissibility,
+    t_fine.state_energetic_admissibility, tol_energetic);
+  EXPECT_NEAR(
+    t_coarse.state_turnover_time, t_fine.state_turnover_time, tol_turnover);
+}
+
+TEST(ODTLESLocalEngine, StepperStateModelEventRateActsAsSamplingScale)
+{
+  constexpr amrex::Real tol = 1.0e-12;
+  constexpr amrex::Real eps = 1.0e-30;
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  auto base_state =
+    makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+      line_geom, 0.0, 0.25);
+
+  pelec::odtles::ODTStepper::Controls low_rate_ctrl{};
+  low_rate_ctrl.max_internal_iterations = 256;
+  low_rate_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  low_rate_ctrl.sampler_controls.event_rate = 200.0;
+  low_rate_ctrl.sampler_controls.min_interval_size = 3;
+  low_rate_ctrl.sampler_controls.deterministic = true;
+  low_rate_ctrl.sampler_controls.seed = 515ULL;
+
+  auto high_rate_ctrl = low_rate_ctrl;
+  high_rate_ctrl.sampler_controls.event_rate = 1000.0;
+
+  auto low_state = base_state;
+  auto high_state = base_state;
+  const auto rep_low = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, low_state, 1.0e-2, low_rate_ctrl);
+  const auto rep_high = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, high_state, 1.0e-2, high_rate_ctrl);
+
+  auto mean_wait = [](const auto& trace) -> amrex::Real {
+    if (trace.empty()) {
+      return 0.0;
+    }
+    amrex::Real sum = 0.0;
+    for (const auto& tr : trace) {
+      sum += tr.wait_time;
+    }
+    return sum / static_cast<amrex::Real>(trace.size());
+  };
+  auto check_acceptance_identity = [=](const auto& trace) {
+    for (const auto& tr : trace) {
+      const amrex::Real expected = std::max<amrex::Real>(
+        0.0, std::min<amrex::Real>(
+               1.0,
+               1.0 - std::exp(
+                       -tr.state_event_hazard *
+                       std::max<amrex::Real>(0.0, tr.wait_time))));
+      EXPECT_NEAR(tr.state_acceptance_probability, expected, tol);
+      const amrex::Real expected_hazard =
+        tr.state_energetic_admissibility / (tr.state_turnover_time + eps);
+      EXPECT_NEAR(tr.state_event_hazard, expected_hazard, tol);
+    }
+  };
+
+  ASSERT_TRUE(rep_low.reached_dt_les);
+  ASSERT_TRUE(rep_high.reached_dt_les);
+  ASSERT_GT(rep_low.attempted_events, 0);
+  ASSERT_GT(rep_high.attempted_events, 0);
+  EXPECT_GT(rep_high.attempted_events, rep_low.attempted_events);
+  EXPECT_LT(mean_wait(rep_high.trace), mean_wait(rep_low.trace));
+
+  check_acceptance_identity(rep_low.trace);
+  check_acceptance_identity(rep_high.trace);
+}
+
+TEST(ODTLESLocalEngine, StepperEventSamplingAvoidsPathologicalReplayWhenSeedAdvances)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0);
+  const auto base_state =
+    makeAdmissibleVelocityProfileStateFromPhysicalCoordinate(
+      line_geom, 0.0, 0.25);
+
+  pelec::odtles::ODTStepper::Controls step_ctrl{};
+  step_ctrl.max_internal_iterations = 256;
+  step_ctrl.incompatible_interval_policy =
+    pelec::odtles::ODTStepper::IncompatibleIntervalPolicy::AdjustToCompatibleElseReject;
+  step_ctrl.sampler_controls.event_rate = 500.0;
+  step_ctrl.sampler_controls.min_interval_size = 3;
+  step_ctrl.sampler_controls.deterministic = true;
+  step_ctrl.sampler_controls.seed = 123456789ULL;
+
+  auto state_a = base_state;
+  auto state_b = base_state;
+  const auto rep_a = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, state_a, 1.0e-2, step_ctrl);
+  const auto rep_b = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, state_b, 1.0e-2, step_ctrl);
+
+  ASSERT_EQ(rep_a.attempted_events, rep_b.attempted_events);
+  ASSERT_EQ(rep_a.applied_events, rep_b.applied_events);
+  ASSERT_EQ(rep_a.rejected_events, rep_b.rejected_events);
+  ASSERT_EQ(rep_a.trace.size(), rep_b.trace.size());
+
+  auto splitmix64 = [](std::uint64_t x) -> std::uint64_t {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+  };
+
+  auto advanced_ctrl = step_ctrl;
+  advanced_ctrl.sampler_controls.seed = splitmix64(step_ctrl.sampler_controls.seed);
+  auto state_c = base_state;
+  const auto rep_c = pelec::odtles::ODTStepper::advanceOneLESTimestep(
+    line_geom, state_c, 1.0e-2, advanced_ctrl);
+
+  EXPECT_TRUE(rep_c.reached_dt_les);
+  EXPECT_GT(rep_c.attempted_events, 0);
+
+  const bool replayed_identically =
+    rep_c.attempted_events == rep_a.attempted_events &&
+    rep_c.applied_events == rep_a.applied_events &&
+    rep_c.rejected_events == rep_a.rejected_events &&
+    rep_c.trace.size() == rep_a.trace.size();
+  EXPECT_FALSE(replayed_identically);
 }
 
 TEST(ODTLESLocalEngine, MomentExtractorMVPValidation)
@@ -1316,6 +1814,86 @@ TEST(
   EXPECT_DOUBLE_EQ(step_ctrl.diffusion_controls.molecular_viscosity_floor, 0.0);
   EXPECT_TRUE(
     step_ctrl.diffusion_controls.fail_on_molecular_viscosity_recovery_failure);
+}
+
+TEST(
+  ODTLESLocalEngine,
+  ODTDiffusionManufacturedNeumannModeRefinesAcrossSubsegments)
+{
+  const amrex::Box domain(
+    amrex::IntVect(AMREX_D_DECL(0, 0, 0)),
+    amrex::IntVect(AMREX_D_DECL(8, 0, 0)));
+  const amrex::RealBox rb(
+    {AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(9.0, 1.0, 1.0)});
+  int is_per[AMREX_SPACEDIM] = {AMREX_D_DECL(0, 0, 0)};
+  const amrex::Geometry geom(domain, &rb, 0, is_per);
+  const amrex::IntVect owner(AMREX_D_DECL(4, 0, 0));
+
+  constexpr amrex::Real nu = 0.07;
+  constexpr amrex::Real dt = 1.0e-2;
+  constexpr amrex::Real two_pi = 2.0 * 3.14159265358979323846;
+
+  auto run_case = [&](int nsub) {
+    pelec::odtles::ODTLineGeometry line_geom(geom, 0, owner, 0, nsub);
+    pelec::odtles::ODTLineState state;
+    state.initialize(line_geom);
+
+    const amrex::Real L = line_geom.supportLength();
+    AMREX_ALWAYS_ASSERT(L > 0.0);
+
+    for (int i = 0; i < state.numCells(); ++i) {
+      ConservativeCell c{};
+      const auto& seg =
+        line_geom.supportCells()[static_cast<std::size_t>(i)];
+      const amrex::Real s = seg.s_center;
+      const amrex::Real u0 = std::cos(two_pi * s / L);
+      c.rho = 1.0;
+      c.rhou = u0;
+      c.rhov = 0.0;
+      c.rhow = 0.0;
+      c.rhoE = 5.0 + 0.5 * u0 * u0;
+      c.rhoY[0] = 1.0;
+      for (int n = 1; n < NUM_SPECIES; ++n) {
+        c.rhoY[static_cast<std::size_t>(n)] = 0.0;
+      }
+      state.setCell(i, c);
+    }
+    state.setValid(true);
+
+    pelec::odtles::ODTDiffusion::Controls ctrl{};
+    ctrl.diffuse_component.fill(false);
+    ctrl.diffuse_component[static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU)] =
+      true;
+    ctrl.use_molecular_viscosity_for_momentum = false;
+    ctrl.diffusivity.fill(0.0);
+    ctrl.diffusivity[static_cast<int>(pelec::odtles::ODTDiffusion::Component::RhoU)] =
+      nu;
+    pelec::odtles::ODTDiffusion::applyImplicitUniform(line_geom, state, dt, ctrl);
+
+    const amrex::Real amp = std::exp(-nu * std::pow(two_pi / L, 2) * dt);
+    amrex::Real err2 = 0.0;
+    amrex::Real wsum = 0.0;
+    for (int i = 0; i < state.numCells(); ++i) {
+      const auto& seg =
+        line_geom.supportCells()[static_cast<std::size_t>(i)];
+      const amrex::Real w = seg.s_interval.hi - seg.s_interval.lo;
+      const amrex::Real s = seg.s_center;
+      const amrex::Real u_exact = amp * std::cos(two_pi * s / L);
+      const amrex::Real e = state.cell(i).rhou - u_exact;
+      err2 += w * e * e;
+      wsum += w;
+    }
+    AMREX_ALWAYS_ASSERT(wsum > 0.0);
+    return std::sqrt(err2 / wsum);
+  };
+
+  const amrex::Real err3 = run_case(3);
+  const amrex::Real err5 = run_case(5);
+  const amrex::Real err7 = run_case(7);
+
+  EXPECT_LT(err5, err3);
+  EXPECT_LT(err7, err5);
+  EXPECT_LT(err7, 0.8 * err5);
 }
 
 TEST(
@@ -2295,6 +2873,7 @@ TEST(ODTLESLocalEngine, RuntimeODTEventRateZeroKeepsDiffusionOnlyStepperCounters
   EXPECT_GT(sig.stepped_entries, 0);
   EXPECT_EQ(sig.stepper_attempted_events, 0);
   EXPECT_EQ(sig.stepper_applied_events, 0);
+  EXPECT_EQ(sig.stepper_rejected_state_model, 0);
   EXPECT_EQ(sig.stepper_rejected_events, 0);
   EXPECT_EQ(sig.stepper_diffusion_only_catchup, sig.stepped_entries);
 }
@@ -2318,6 +2897,7 @@ TEST(
   EXPECT_EQ(
     sig.stepper_attempted_events,
     sig.stepper_applied_events + sig.stepper_rejected_events);
+  EXPECT_LE(sig.stepper_rejected_state_model, sig.stepper_rejected_events);
   EXPECT_GT(sig.stepper_attempted_events, sig.stepped_entries);
 
   // Event activation must preserve the current momentum-only SGS contract.

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <AMReX.H>
@@ -133,6 +134,39 @@ computeDynamicViscosity(
   return mu;
 }
 
+amrex::Real
+lineSegmentSpacing(const ODTLineGeometry& geom)
+{
+  const auto& segs = geom.supportCells();
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    !segs.empty(), "ODTDiffusion requires non-empty line support");
+
+  amrex::Real sum_w = 0.0;
+  amrex::Real min_w = std::numeric_limits<amrex::Real>::max();
+  amrex::Real max_w = 0.0;
+  for (const auto& seg : segs) {
+    const amrex::Real w = seg.s_interval.hi - seg.s_interval.lo;
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      w > 0.0,
+      "ODTDiffusion requires positive physical widths on support segments");
+    sum_w += w;
+    min_w = std::min(min_w, w);
+    max_w = std::max(max_w, w);
+  }
+
+  const amrex::Real dx = sum_w / static_cast<amrex::Real>(segs.size());
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    dx > 0.0, "ODTDiffusion requires positive average segment spacing");
+
+  const amrex::Real tol = 1.0e-12 * (std::abs(dx) + 1.0);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    (max_w - min_w) <= tol,
+    "ODTDiffusion expects near-uniform support-segment spacing for the "
+    "current implicit tridiagonal operator");
+
+  return dx;
+}
+
 } // namespace
 
 ODTDiffusion::MomentumViscosityProfile
@@ -182,8 +216,11 @@ ODTDiffusion::applyImplicitUniform(
     return;
   }
 
-  const amrex::Real dx = geom.deltaS();
-  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(dx > 0.0, "ODTDiffusion requires deltaS > 0");
+  // Use the physical support-segment spacing (host-cell width / nsub) so
+  // subsegment refinement is represented consistently in the local operator.
+  const amrex::Real dx = lineSegmentSpacing(geom);
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    dx > 0.0, "ODTDiffusion requires positive support-segment spacing");
   const amrex::Real inv_dx2 = 1.0 / (dx * dx);
 
   std::vector<amrex::Real> q_old(static_cast<std::size_t>(n), 0.0);

@@ -206,6 +206,24 @@ ODTManager::getOrCreateLineEntry(
   auto it_inserted_pair = m_line_entries.emplace(key, LineEntry{});
   auto it = it_inserted_pair.first;
   if (it_inserted_pair.second) {
+    const std::uint64_t lx = static_cast<std::uint64_t>(
+      static_cast<std::uint32_t>(owner_cell[0]));
+    const std::uint64_t ly = static_cast<std::uint64_t>(
+      static_cast<std::uint32_t>(owner_cell[1]));
+    const std::uint64_t lz = static_cast<std::uint64_t>(
+      static_cast<std::uint32_t>(owner_cell[2]));
+    const std::uint64_t ll = static_cast<std::uint64_t>(
+      static_cast<std::uint32_t>(level));
+    const std::uint64_t ld = static_cast<std::uint64_t>(
+      static_cast<std::uint32_t>(dir));
+    it->second.runtime_event_seed =
+      0x9E3779B97F4A7C15ULL ^
+      (ll * 0xBF58476D1CE4E5B9ULL) ^
+      (ld * 0x94D049BB133111EBULL) ^
+      (lx * 0xD2B74407B1CE6E93ULL) ^
+      (ly * 0xCA5A826395121157ULL) ^
+      (lz * 0x9E3779B185EBCA87ULL);
+    it->second.runtime_event_seed_initialized = true;
     it->second.geometry.define(
       geom, level, owner_cell, dir, m_params.subsegments_per_host_cell);
     it->second.state.initialize(it->second.geometry);

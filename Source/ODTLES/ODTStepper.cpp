@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 #include <AMReX.H>
 #include <AMReX_Box.H>
@@ -52,6 +53,220 @@ adjustIntervalToTripletCompatible(
   adjusted.i_lo = i_lo;
   adjusted.i_hi = i_lo + n_target - 1;
   return adjusted.valid() && adjusted.i_hi < line_cells;
+}
+
+struct LocalEventModel
+{
+  amrex::Real energetic_admissibility = 0.0;
+  amrex::Real turnover_time = 0.0;
+  amrex::Real event_hazard = 0.0;
+  amrex::Real acceptance_probability = 0.0;
+};
+
+struct IntervalProposal
+{
+  ODTTripletMap::EddyInterval interval{};
+  amrex::Real probability = 0.0;
+  bool valid = false;
+};
+
+amrex::Real
+intervalPhysicalLength(
+  const ODTLineGeometry& geom, const ODTTripletMap::EddyInterval& interval)
+{
+  if (!interval.valid()) {
+    return 0.0;
+  }
+  const auto& segs = geom.supportCells();
+  const int lo = std::max(0, interval.i_lo);
+  const int hi = std::min(static_cast<int>(segs.size()) - 1, interval.i_hi);
+  if (lo > hi) {
+    return 0.0;
+  }
+  amrex::Real len = 0.0;
+  for (int i = lo; i <= hi; ++i) {
+    const auto& seg = segs[static_cast<std::size_t>(i)];
+    len += seg.s_interval.hi - seg.s_interval.lo;
+  }
+  return std::max<amrex::Real>(0.0, len);
+}
+
+IntervalProposal
+sampleIntervalProposal(
+  int line_cells, int min_interval_size, ODTEventSampler& sampler)
+{
+  IntervalProposal out{};
+  if (line_cells <= 0) {
+    return out;
+  }
+  const int min_n = std::max(1, min_interval_size);
+  const int max_n = line_cells;
+  if (min_n > max_n) {
+    return out;
+  }
+
+  // Use a scale-aware 1/n size weighting: this favors smaller events while
+  // preserving support over all admissible interval sizes.
+  std::vector<amrex::Real> weights(static_cast<std::size_t>(max_n - min_n + 1));
+  amrex::Real w_sum = 0.0;
+  for (int n = min_n; n <= max_n; ++n) {
+    const amrex::Real w = 1.0 / static_cast<amrex::Real>(n);
+    weights[static_cast<std::size_t>(n - min_n)] = w;
+    w_sum += w;
+  }
+  if (w_sum <= 0.0) {
+    return out;
+  }
+
+  const amrex::Real u = sampler.sampleUnitUniform() * w_sum;
+  amrex::Real accum = 0.0;
+  int n = max_n;
+  for (int cand = min_n; cand <= max_n; ++cand) {
+    accum += weights[static_cast<std::size_t>(cand - min_n)];
+    if (u <= accum || cand == max_n) {
+      n = cand;
+      break;
+    }
+  }
+
+  const int n_starts = line_cells - n + 1;
+  if (n_starts <= 0) {
+    return out;
+  }
+  const int i_lo =
+    std::min(n_starts - 1, static_cast<int>(sampler.sampleUnitUniform() * n_starts));
+
+  out.interval.i_lo = i_lo;
+  out.interval.i_hi = i_lo + n - 1;
+  const amrex::Real p_n =
+    weights[static_cast<std::size_t>(n - min_n)] / w_sum;
+  const amrex::Real p_i = 1.0 / static_cast<amrex::Real>(n_starts);
+  out.probability = p_n * p_i;
+  out.valid = out.interval.valid();
+  return out;
+}
+
+LocalEventModel
+stateDependentEventModel(
+  const ODTLineGeometry& geom,
+  const ODTLineState& line_state,
+  const ODTTripletMap::EddyInterval& interval,
+  amrex::Real wait_time)
+{
+  LocalEventModel out{};
+  if (!interval.valid()) {
+    return out;
+  }
+
+  const int i_lo = std::max(0, interval.i_lo);
+  const int i_hi = std::min(line_state.numCells() - 1, interval.i_hi);
+  if (i_lo > i_hi) {
+    return out;
+  }
+  const auto& segs = geom.supportCells();
+  if (static_cast<int>(segs.size()) != line_state.numCells()) {
+    return out;
+  }
+
+  amrex::Real rho_sum = 0.0;
+  amrex::Real rhou_sum = 0.0;
+  amrex::Real rhov_sum = 0.0;
+  amrex::Real rhow_sum = 0.0;
+  for (int i = i_lo; i <= i_hi; ++i) {
+    const auto& c = line_state.cell(i);
+    if (c.rho <= 0.0) {
+      return out;
+    }
+    rho_sum += c.rho;
+    rhou_sum += c.rhou;
+    rhov_sum += c.rhov;
+    rhow_sum += c.rhow;
+  }
+  if (rho_sum <= 0.0) {
+    return out;
+  }
+
+  const amrex::Real inv_rho_sum = 1.0 / rho_sum;
+  const amrex::Real u_mean = rhou_sum * inv_rho_sum;
+  const amrex::Real v_mean = rhov_sum * inv_rho_sum;
+  const amrex::Real w_mean = rhow_sum * inv_rho_sum;
+
+  amrex::Real var_mass_weighted = 0.0;
+  for (int i = i_lo; i <= i_hi; ++i) {
+    const auto& c = line_state.cell(i);
+    const amrex::Real u = c.rhou / c.rho;
+    const amrex::Real v = c.rhov / c.rho;
+    const amrex::Real w = c.rhow / c.rho;
+    const amrex::Real du = u - u_mean;
+    const amrex::Real dv = v - v_mean;
+    const amrex::Real dw = w - w_mean;
+    var_mass_weighted += c.rho * (du * du + dv * dv + dw * dw);
+  }
+  var_mass_weighted *= inv_rho_sum;
+
+  // Build a translation-invariant internal-gradient scale from velocity
+  // differences across neighboring support cells in the candidate interval.
+  // Scale by interval length so this term stays physically scaled (u^2) and
+  // does not depend on raw segment count.
+  amrex::Real grad_sq_sum = 0.0;
+  amrex::Real grad_w_sum = 0.0;
+  amrex::Real interval_length = 0.0;
+  for (int i = i_lo; i <= i_hi; ++i) {
+    const auto& seg = segs[static_cast<std::size_t>(i)];
+    interval_length += seg.s_interval.hi - seg.s_interval.lo;
+  }
+  interval_length = std::max<amrex::Real>(0.0, interval_length);
+
+  for (int i = i_lo; i < i_hi; ++i) {
+    const auto& c_l = line_state.cell(i);
+    const auto& c_r = line_state.cell(i + 1);
+    const auto& seg_l = segs[static_cast<std::size_t>(i)];
+    const auto& seg_r = segs[static_cast<std::size_t>(i + 1)];
+    const amrex::Real ds = std::abs(seg_r.s_center - seg_l.s_center);
+    if (ds <= 0.0) {
+      continue;
+    }
+    const amrex::Real u_l = c_l.rhou / c_l.rho;
+    const amrex::Real v_l = c_l.rhov / c_l.rho;
+    const amrex::Real w_l = c_l.rhow / c_l.rho;
+    const amrex::Real u_r = c_r.rhou / c_r.rho;
+    const amrex::Real v_r = c_r.rhov / c_r.rho;
+    const amrex::Real w_r = c_r.rhow / c_r.rho;
+    const amrex::Real du = (u_r - u_l) / ds;
+    const amrex::Real dv = (v_r - v_l) / ds;
+    const amrex::Real dw = (w_r - w_l) / ds;
+    const amrex::Real w_face = 0.5 * (c_l.rho + c_r.rho);
+    grad_sq_sum += w_face * (du * du + dv * dv + dw * dw);
+    grad_w_sum += w_face;
+  }
+  const amrex::Real grad_rate_mass_weighted =
+    (grad_w_sum > 0.0) ? (grad_sq_sum / grad_w_sum) : 0.0;
+  const amrex::Real grad_mass_weighted =
+    interval_length * interval_length * grad_rate_mass_weighted;
+
+  const amrex::Real eps = 1.0e-30;
+  out.energetic_admissibility =
+    grad_mass_weighted / (grad_mass_weighted + var_mass_weighted + eps);
+  out.energetic_admissibility = std::max<amrex::Real>(
+    0.0, std::min<amrex::Real>(1.0, out.energetic_admissibility));
+
+  const amrex::Real u_char = std::sqrt(std::max<amrex::Real>(
+    0.0, grad_mass_weighted + var_mass_weighted));
+  out.turnover_time = interval_length / (u_char + eps);
+  out.turnover_time = std::max<amrex::Real>(0.0, out.turnover_time);
+
+  const amrex::Real wait = std::max<amrex::Real>(0.0, wait_time);
+  // Local accepted-event hazard [1/time], built from state alone.
+  out.event_hazard =
+    out.energetic_admissibility / (out.turnover_time + eps);
+  out.event_hazard = std::max<amrex::Real>(0.0, out.event_hazard);
+  // Proposal/acceptance consistency:
+  // candidate proposals are Poisson in time; acceptance uses the local hazard
+  // over the sampled waiting interval.
+  out.acceptance_probability = 1.0 - std::exp(-out.event_hazard * wait);
+  out.acceptance_probability = std::max<amrex::Real>(
+    0.0, std::min<amrex::Real>(1.0, out.acceptance_probability));
+  return out;
 }
 
 bool
@@ -131,8 +346,10 @@ ODTStepper::advanceOneLESTimestep(
     const amrex::Real remaining = dt_les - t;
     AMREX_ALWAYS_ASSERT(remaining > 0.0);
 
-    const auto sample = sampler.sample(line_state.numCells());
-    if (!sample.valid) {
+    const amrex::Real event_rate =
+      std::max<amrex::Real>(0.0, controls.sampler_controls.event_rate);
+    const amrex::Real wait_time = sampler.sampleExponentialWait(event_rate);
+    if (!std::isfinite(wait_time)) {
       ODTDiffusion::applyImplicitUniform(
         geom, line_state, remaining, controls.diffusion_controls);
       report.diffusion_substeps += 1;
@@ -141,8 +358,8 @@ ODTStepper::advanceOneLESTimestep(
       break;
     }
 
-    const amrex::Real wait_time = std::max<amrex::Real>(0.0, sample.wait_time);
-    if (wait_time >= remaining - tol) {
+    const amrex::Real wait_time_clamped = std::max<amrex::Real>(0.0, wait_time);
+    if (wait_time_clamped >= remaining - tol) {
       ODTDiffusion::applyImplicitUniform(
         geom, line_state, remaining, controls.diffusion_controls);
       report.diffusion_substeps += 1;
@@ -151,21 +368,35 @@ ODTStepper::advanceOneLESTimestep(
       break;
     }
 
-    if (wait_time > 0.0) {
+    if (wait_time_clamped > 0.0) {
       ODTDiffusion::applyImplicitUniform(
-        geom, line_state, wait_time, controls.diffusion_controls);
+        geom, line_state, wait_time_clamped, controls.diffusion_controls);
       report.diffusion_substeps += 1;
-      t += wait_time;
+      t += wait_time_clamped;
+    }
+
+    const auto proposal = sampleIntervalProposal(
+      line_state.numCells(), controls.sampler_controls.min_interval_size, sampler);
+    if (!proposal.valid) {
+      ODTDiffusion::applyImplicitUniform(
+        geom, line_state, dt_les - t, controls.diffusion_controls);
+      report.diffusion_substeps += 1;
+      t = dt_les;
+      report.closed_by_diffusion_only_catchup = true;
+      break;
     }
 
     report.attempted_events += 1;
     SampleTrace tr{};
     tr.t_before = t;
-    tr.wait_time = wait_time;
-    tr.sampled_interval = sample.interval;
-    tr.applied_interval = sample.interval;
+    tr.wait_time = wait_time_clamped;
+    tr.sampled_interval = proposal.interval;
+    tr.applied_interval = proposal.interval;
+    tr.sampled_interval_probability = proposal.probability;
+    tr.sampled_interval_physical_length =
+      intervalPhysicalLength(geom, proposal.interval);
     tr.compatible_triplet_interval =
-      ODTTripletMap::canApplyPermutation(line_state, sample.interval);
+      ODTTripletMap::canApplyPermutation(line_state, proposal.interval);
 
     if (!tr.compatible_triplet_interval) {
       switch (controls.incompatible_interval_policy) {
@@ -173,7 +404,7 @@ ODTStepper::advanceOneLESTimestep(
         ODTTripletMap::EddyInterval adjusted{};
         if (
           adjustIntervalToTripletCompatible(
-            sample.interval, line_state.numCells(), adjusted) &&
+            proposal.interval, line_state.numCells(), adjusted) &&
           ODTTripletMap::canApplyPermutation(line_state, adjusted)) {
           tr.adjusted_to_compatible = true;
           tr.applied_interval = adjusted;
@@ -200,6 +431,24 @@ ODTStepper::advanceOneLESTimestep(
     switch (controls.incompatible_interval_policy) {
     case IncompatibleIntervalPolicy::AdjustToCompatibleElseReject:
     case IncompatibleIntervalPolicy::RejectAndContinue: {
+      const auto local_model =
+        stateDependentEventModel(
+          geom, line_state, tr.applied_interval, wait_time_clamped);
+      tr.state_energetic_admissibility = local_model.energetic_admissibility;
+      tr.state_turnover_time = local_model.turnover_time;
+      tr.state_event_hazard = local_model.event_hazard;
+      tr.state_acceptance_probability = local_model.acceptance_probability;
+      tr.acceptance_draw = sampler.sampleUnitUniform();
+      tr.accepted_by_state_model =
+        (tr.acceptance_draw <= tr.state_acceptance_probability);
+      if (!tr.accepted_by_state_model) {
+        tr.rejected = true;
+        report.rejected_state_model_events += 1;
+        report.rejected_events += 1;
+        report.trace.push_back(tr);
+        continue;
+      }
+
       const auto rep = ODTTripletMap::applyPermutationWithKernel(
         line_state, tr.applied_interval, controls.kernel_spec);
       tr.applied = rep.applied;
@@ -330,6 +579,7 @@ ODTStepper::runMVPValidationHook()
     event_rep_a.applied_events + event_rep_a.rejected_events ==
       event_rep_a.attempted_events &&
     event_rep_a.adjusted_events <= event_rep_a.attempted_events &&
+    event_rep_a.rejected_state_model_events <= event_rep_a.rejected_events &&
     event_rep_a.rejected_incompatible_events <= event_rep_a.rejected_events &&
     static_cast<int>(event_rep_a.trace.size()) == event_rep_a.attempted_events;
   out.metadata_consistent = metadata_a_ok;

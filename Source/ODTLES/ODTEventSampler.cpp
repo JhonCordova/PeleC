@@ -41,6 +41,23 @@ ODTEventSampler::reseed(std::uint64_t seed)
   m_rng.seed(static_cast<std::mt19937_64::result_type>(seed));
 }
 
+amrex::Real
+ODTEventSampler::sampleUnitUniform()
+{
+  std::uniform_real_distribution<amrex::Real> dist(0.0, 1.0);
+  return dist(m_rng);
+}
+
+amrex::Real
+ODTEventSampler::sampleExponentialWait(amrex::Real rate)
+{
+  if (rate <= 0.0) {
+    return std::numeric_limits<amrex::Real>::infinity();
+  }
+  std::exponential_distribution<amrex::Real> wait_dist(rate);
+  return wait_dist(m_rng);
+}
+
 ODTEventSampler::EventSample
 ODTEventSampler::sample(int line_cells)
 {
@@ -52,8 +69,7 @@ ODTEventSampler::sample(int line_cells)
     return out;
   }
 
-  std::exponential_distribution<amrex::Real> wait_dist(m_ctrl.event_rate);
-  out.wait_time = wait_dist(m_rng);
+  out.wait_time = sampleExponentialWait(m_ctrl.event_rate);
 
   const int min_n = std::max(1, m_ctrl.min_interval_size);
   const int max_n = line_cells;

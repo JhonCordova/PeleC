@@ -38,10 +38,18 @@ public:
   {
     amrex::Real t_before = 0.0;
     amrex::Real wait_time = 0.0;
+    amrex::Real sampled_interval_probability = 0.0;
+    amrex::Real sampled_interval_physical_length = 0.0;
+    amrex::Real state_energetic_admissibility = 0.0;
+    amrex::Real state_turnover_time = 0.0;
+    amrex::Real state_event_hazard = 0.0;
+    amrex::Real state_acceptance_probability = 0.0;
+    amrex::Real acceptance_draw = 1.0;
     ODTTripletMap::EddyInterval sampled_interval{};
     ODTTripletMap::EddyInterval applied_interval{};
     bool compatible_triplet_interval = false; // compatibility of sampled interval
     bool adjusted_to_compatible = false;
+    bool accepted_by_state_model = false;
     bool rejected = false;
     bool applied = false;
   };
@@ -54,6 +62,7 @@ public:
     int resampled_events = 0;
     int applied_events = 0;
     int rejected_incompatible_events = 0;
+    int rejected_state_model_events = 0;
     int rejected_events = 0;
     int diffusion_substeps = 0;
     bool closed_by_diffusion_only_catchup = false;

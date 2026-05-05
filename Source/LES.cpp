@@ -218,15 +218,41 @@ PeleC::getODTLESTerm(
       << ", mixed=" << stats.rejected_mixed_entries << "]" << std::endl;
   }
   if (verbose != 0 && stats.stepped_entries > 0) {
+    amrex::Real l1_umx = 0.0;
+    amrex::Real l1_umy = 0.0;
+    amrex::Real l1_umz = 0.0;
+    amrex::Real l1_ueden = 0.0;
+    for (amrex::MFIter mfi(LESTerm, false); mfi.isValid(); ++mfi) {
+      const auto bx = mfi.validbox();
+      const auto arr = LESTerm.const_array(mfi);
+      for (amrex::IntVect iv = bx.smallEnd(); iv <= bx.bigEnd(); bx.next(iv)) {
+        l1_umx += std::abs(arr(iv, UMX));
+        l1_umy += std::abs(arr(iv, UMY));
+        l1_umz += std::abs(arr(iv, UMZ));
+        l1_ueden += std::abs(arr(iv, UEDEN));
+      }
+    }
+    amrex::ParallelDescriptor::ReduceRealSum(l1_umx);
+    amrex::ParallelDescriptor::ReduceRealSum(l1_umy);
+    amrex::ParallelDescriptor::ReduceRealSum(l1_umz);
+    amrex::ParallelDescriptor::ReduceRealSum(l1_ueden);
+
     amrex::Print() << "ODTLES: stepped " << stats.stepped_entries
                    << " local lines over dt_LES with neutral SGS return. "
-                   << "[attempted_events=" << stats.stepper_attempted_events
+                   << "[event_rate=" << odt_event_rate
+                   << ", subsegments_per_host_cell="
+                   << odt_subsegments_per_host_cell
+                   << ", attempted_events=" << stats.stepper_attempted_events
                    << ", applied_events=" << stats.stepper_applied_events
+                   << ", rejected_state_model_events="
+                   << stats.stepper_rejected_state_model
                    << ", rejected_events=" << stats.stepper_rejected_events
                    << ", diffusion_only_catchup_entries="
                    << stats.stepper_diffusion_only_catchup
                    << ", directional_momentum_columns="
-                   << stats.moment_columns_built << "]" << std::endl;
+                   << stats.moment_columns_built << ", l1_umx=" << l1_umx
+                   << ", l1_umy=" << l1_umy << ", l1_umz=" << l1_umz
+                   << ", l1_ueden=" << l1_ueden << "]" << std::endl;
   }
 }
 
@@ -428,12 +454,23 @@ accumulateRuntimeODTMomentumLESTerm(
         ODTStepper::Controls step_ctrl{};
         configureRuntimeODTStepperControls(odt_manager.params(), step_ctrl);
         step_ctrl.sampler_controls.deterministic = true;
-        step_ctrl.sampler_controls.seed = static_cast<std::uint64_t>(
-          (static_cast<unsigned>(level) + 1U) * 73856093U ^
-          (static_cast<unsigned>(dir) + 1U) * 19349663U ^
-          (static_cast<unsigned>(iv[0]) + 1U) * 83492791U ^
-          (static_cast<unsigned>(iv[1]) + 1U) * 2654435761U ^
-          (static_cast<unsigned>(iv[2]) + 1U) * 97531U);
+        if (!stepped_entry->runtime_event_seed_initialized) {
+          stepped_entry->runtime_event_seed = static_cast<std::uint64_t>(
+            (static_cast<unsigned>(level) + 1U) * 73856093U ^
+            (static_cast<unsigned>(dir) + 1U) * 19349663U ^
+            (static_cast<unsigned>(iv[0]) + 1U) * 83492791U ^
+            (static_cast<unsigned>(iv[1]) + 1U) * 2654435761U ^
+            (static_cast<unsigned>(iv[2]) + 1U) * 97531U);
+          stepped_entry->runtime_event_seed_initialized = true;
+        }
+        step_ctrl.sampler_controls.seed = stepped_entry->runtime_event_seed;
+        auto splitmix64 = [](std::uint64_t x) -> std::uint64_t {
+          x += 0x9E3779B97F4A7C15ULL;
+          x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+          x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+          return x ^ (x >> 31);
+        };
+        stepped_entry->runtime_event_seed = splitmix64(step_ctrl.sampler_controls.seed);
 
         const auto step_rep = ODTStepper::advanceOneLESTimestep(
           stepped_entry->geometry, stepped_entry->state, dt, step_ctrl);
@@ -464,6 +501,8 @@ accumulateRuntimeODTMomentumLESTerm(
         ++stats.stepped_entries;
         stats.stepper_attempted_events += step_rep.attempted_events;
         stats.stepper_applied_events += step_rep.applied_events;
+        stats.stepper_rejected_state_model +=
+          step_rep.rejected_state_model_events;
         stats.stepper_rejected_events += step_rep.rejected_events;
         if (step_rep.closed_by_diffusion_only_catchup) {
           ++stats.stepper_diffusion_only_catchup;

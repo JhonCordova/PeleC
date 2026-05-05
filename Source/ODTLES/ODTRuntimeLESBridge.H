@@ -27,6 +27,7 @@ struct RuntimeDepositionStats
   long stepped_entries = 0;
   long stepper_attempted_events = 0;
   long stepper_applied_events = 0;
+  long stepper_rejected_state_model = 0;
   long stepper_rejected_events = 0;
   long stepper_diffusion_only_catchup = 0;
   long moment_columns_built = 0;

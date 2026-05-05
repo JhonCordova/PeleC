@@ -17,7 +17,7 @@ class ODTEventSampler
 public:
   struct Controls
   {
-    // Poisson event-rate proxy for MVP internal waiting-time sampling.
+    // Poisson candidate sampling rate for internal waiting-time draws.
     amrex::Real event_rate = 0.0;
     bool deterministic = true;
     std::uint64_t seed = 1ULL;
@@ -39,6 +39,8 @@ public:
   void setControls(const Controls& controls);
   const Controls& controls() const noexcept { return m_ctrl; }
   void reseed(std::uint64_t seed);
+  amrex::Real sampleUnitUniform();
+  amrex::Real sampleExponentialWait(amrex::Real rate);
 
   // Sample waiting time + interval over the local line support.
   EventSample sample(int line_cells);

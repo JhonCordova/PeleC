@@ -1,6 +1,7 @@
 #ifndef PELEC_ODTLES_ODTMANAGER_H
 #define PELEC_ODTLES_ODTMANAGER_H
 
+#include <cstdint>
 #include <cstddef>
 #include <map>
 #include <vector>
@@ -27,6 +28,8 @@ public:
   {
     ODTLineGeometry geometry;
     ODTLineState state;
+    std::uint64_t runtime_event_seed = 0ULL;
+    bool runtime_event_seed_initialized = false;
   };
 
   enum class SupportProvenance : int
